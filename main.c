@@ -572,17 +572,16 @@ static void handle_input(int pty_fd, GhosttyKeyEncoder encoder,
 // Returns true while a drag is in progress so the caller can skip
 // normal mouse handling if desired.
 static bool handle_scrollbar(GhosttyTerminal terminal,
-                             GhosttyRenderState render_state,
+                             GhosttyTerminalScrollbar *scrollbar,
                              bool *dragging)
 {
-    // Query scrollbar geometry from the terminal.
-    GhosttyTerminalScrollbar scrollbar = {0};
-    if (ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR,
-                             &scrollbar) != GHOSTTY_SUCCESS)
+    // The scrollbar snapshot is refreshed only when terminal render state is
+    // dirty.  Hit testing itself therefore needs no terminal query.
+    if (!scrollbar)
         return false;
 
     // Nothing to drag when the viewport covers all content.
-    if (scrollbar.total <= scrollbar.len) {
+    if (scrollbar->total <= scrollbar->len) {
         *dragging = false;
         return false;
     }
@@ -606,20 +605,22 @@ static bool handle_scrollbar(GhosttyTerminal terminal,
         // Map mouse Y directly to an absolute scroll offset.
         // Y=0 → top of scrollback (offset 0), Y=scr_h → bottom
         // (offset = total - len).
-        uint64_t scrollable = scrollbar.total - scrollbar.len;
+        uint64_t scrollable = scrollbar->total - scrollbar->len;
         double frac = (double)mpos.y / (double)scr_h;
         if (frac < 0.0) frac = 0.0;
         if (frac > 1.0) frac = 1.0;
         int64_t target = (int64_t)(frac * (double)scrollable);
 
-        intptr_t delta = (intptr_t)(target - (int64_t)scrollbar.offset);
+        intptr_t delta = (intptr_t)(target - (int64_t)scrollbar->offset);
         if (delta != 0) {
             GhosttyTerminalScrollViewport sv = {
                 .tag = GHOSTTY_SCROLL_VIEWPORT_DELTA,
                 .value = { .delta = delta },
             };
             ghostty_terminal_scroll_viewport(terminal, sv);
-            ghostty_render_state_update(render_state, terminal);
+            // Keep the local snapshot coherent during a continuous drag. The
+            // render-state update later in this frame refreshes it precisely.
+            scrollbar->offset = (uint64_t)target;
         }
     }
 
@@ -1304,6 +1305,7 @@ int main(void)
     GhosttyRenderStateRowIterator row_iter = NULL;
     GhosttyRenderStateRowCells row_cells = NULL;
     GhosttyKittyGraphicsPlacementIterator placement_iter = NULL;
+    RenderTexture2D terminal_surface = {0};
     int exit_code = 0;
 
     // Install the PNG decoder via the sys interface so the terminal can
@@ -1459,6 +1461,17 @@ int main(void)
         goto cleanup;
     }
 
+    // Raylib is an immediate-mode renderer, so skipping BeginDrawing entirely
+    // is not safe: the window must still present frames and poll events. Keep
+    // the expensive terminal rendering in a persistent texture instead. On a
+    // clean libghostty frame we only copy this texture to the window.
+    terminal_surface = LoadRenderTexture(scr_w, scr_h);
+    if (terminal_surface.texture.id == 0) {
+        fprintf(stderr, "LoadRenderTexture failed\n");
+        exit_code = 1;
+        goto cleanup;
+    }
+
     // Track window size so we only recalculate the grid on actual changes.
     int prev_width = scr_w;
     int prev_height = scr_h;
@@ -1471,6 +1484,13 @@ int main(void)
     // Scrollbar drag state — when the user clicks and drags the
     // scrollbar thumb we continuously reposition the viewport.
     bool scrollbar_dragging = false;
+
+    // Values below are part of the cached rendered frame. They are refreshed
+    // only after libghostty reports a partial or full change.
+    GhosttyTerminalScrollbar scrollbar = {0};
+    bool scrollbar_valid = false;
+    Color win_bg = BLACK;
+    bool force_terminal_redraw = true;
 
     // Set when the pty signals EOF/error — the child's side is closed.
     bool child_exited = false;
@@ -1509,6 +1529,17 @@ int main(void)
                 ioctl(pty_fd, TIOCSWINSZ, &new_ws);
                 prev_width = w;
                 prev_height = h;
+
+                // The cached texture has window-sized coordinates, so resize
+                // it along with the window and repaint it below.
+                UnloadRenderTexture(terminal_surface);
+                terminal_surface = LoadRenderTexture(w, h);
+                if (terminal_surface.texture.id == 0) {
+                    fprintf(stderr, "LoadRenderTexture failed after resize\n");
+                    exit_code = 1;
+                    break;
+                }
+                force_terminal_redraw = true;
             }
         }
 
@@ -1568,8 +1599,9 @@ int main(void)
         // Handle scrollbar drag-to-scroll before mouse forwarding so
         // clicks on the scrollbar region don't leak into terminal apps
         // (e.g. vim, tmux) as spurious mouse events.
-        bool scrollbar_consumed = handle_scrollbar(terminal, render_state,
-                                                   &scrollbar_dragging);
+        bool scrollbar_consumed = handle_scrollbar(
+            terminal, scrollbar_valid ? &scrollbar : NULL,
+            &scrollbar_dragging);
 
         // Forward keyboard/mouse input only while the child is alive.
         if (!child_exited) {
@@ -1584,24 +1616,53 @@ int main(void)
         // render state owns everything we need to draw the frame.
         ghostty_render_state_update(render_state, terminal);
 
-        // Get the terminal's background color from the render state.
-        GhosttyRenderStateColors bg_colors = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
-        ghostty_render_state_colors_get(render_state, &bg_colors);
-        Color win_bg = { bg_colors.background.r, bg_colors.background.g, bg_colors.background.b, 255 };
+        GhosttyRenderStateDirty dirty = GHOSTTY_RENDER_STATE_DIRTY_FALSE;
+        ghostty_render_state_get(render_state,
+            GHOSTTY_RENDER_STATE_DATA_DIRTY, &dirty);
 
-        // Query scrollbar state for the renderer.
-        GhosttyTerminalScrollbar scrollbar = {0};
-        GhosttyTerminalScrollbar *scrollbar_ptr = NULL;
-        if (ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR,
-                                 &scrollbar) == GHOSTTY_SUCCESS)
-            scrollbar_ptr = &scrollbar;
+        // Re-query and redraw terminal-owned visual state only when the render
+        // state says something changed. For now PARTIAL also redraws the full
+        // texture; it still eliminates all row/cell/Kitty queries on clean
+        // frames while keeping the implementation small and easy to inspect.
+        if (force_terminal_redraw
+            || dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE) {
+            GhosttyRenderStateColors bg_colors =
+                GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
+            if (ghostty_render_state_colors_get(render_state, &bg_colors)
+                    == GHOSTTY_SUCCESS) {
+                win_bg = (Color){ bg_colors.background.r,
+                                  bg_colors.background.g,
+                                  bg_colors.background.b, 255 };
+            }
 
-        // Draw the current terminal screen.
+            scrollbar_valid = ghostty_terminal_get(
+                terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR, &scrollbar)
+                == GHOSTTY_SUCCESS;
+
+            BeginTextureMode(terminal_surface);
+            ClearBackground(win_bg);
+            render_terminal(render_state, row_iter, row_cells,
+                            mono_font, italic_font,
+                            cell_width, cell_height, font_size, pad,
+                            scrollbar_valid ? &scrollbar : NULL,
+                            terminal, placement_iter);
+            EndTextureMode();
+
+            // Kitty textures were referenced by commands submitted to the
+            // render texture; EndTextureMode has flushed those commands.
+            flush_deferred_textures();
+            force_terminal_redraw = false;
+        }
+
+        // Present the cached terminal surface every frame so Raylib can keep
+        // the window responsive even when terminal state is completely idle.
         BeginDrawing();
         ClearBackground(win_bg);
-        render_terminal(render_state, row_iter, row_cells, mono_font, italic_font,
-                        cell_width, cell_height, font_size, pad,
-                        scrollbar_ptr, terminal, placement_iter);
+        DrawTextureRec(terminal_surface.texture,
+            (Rectangle){0, 0,
+                        (float)terminal_surface.texture.width,
+                        -(float)terminal_surface.texture.height},
+            (Vector2){0, 0}, WHITE);
 
         // Show a banner when the child process has exited so the user
         // knows the shell is gone (they can still scroll / inspect output).
@@ -1626,14 +1687,11 @@ int main(void)
         }
 
         EndDrawing();
-
-        // Free any textures that were uploaded during this frame's
-        // kitty image rendering.  Safe now that EndDrawing() has
-        // flushed all draw commands to the GPU.
-        flush_deferred_textures();
     }
 
 cleanup:
+    if (terminal_surface.texture.id != 0)
+        UnloadRenderTexture(terminal_surface);
     UnloadFont(italic_font);
     UnloadFont(mono_font);
     CloseWindow();
