@@ -6,6 +6,9 @@
   collaboration for enjoyment, understanding, and exploration rather than speed
   to delivery. Explain mechanisms and tradeoffs, use discoveries as teaching
   opportunities, and welcome relevant rabbit holes to explore together.
+- Whenever Codex materially writes code and creates or amends the corresponding
+  commit, ALWAYS include this exact Git commit trailer:
+  `Co-authored-by: Codex <noreply@openai.com>`.
 - Survey prior art before treating an architectural idea as novel. Study who has
   tried related designs, what they actually transmit, and their tradeoffs. Do not
   assume the idea has never been implemented, or invent reasons for adoption.
