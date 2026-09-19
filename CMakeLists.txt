@@ -44,21 +44,34 @@ FetchContent_MakeAvailable(ghostty)
 # --- Embed font as a C header ------------------------------------------------
 # Convert the TTF font into a C byte-array header so we don't rely on C23
 # #embed (which GCC < 15 doesn't support).
-set(FONT_INPUT "${CMAKE_SOURCE_DIR}/fonts/JetBrainsMono-Regular.ttf")
-set(FONT_HEADER "${CMAKE_BINARY_DIR}/font_jetbrains_mono.h")
+set(FONT_INPUT "${CMAKE_SOURCE_DIR}/fonts/MonaspaceArgonFrozen-Regular.ttf")
+set(FONT_HEADER "${CMAKE_BINARY_DIR}/font_monaspace_argon.h")
 add_custom_command(
   OUTPUT "${FONT_HEADER}"
   COMMAND ${CMAKE_COMMAND}
     -DINPUT=${FONT_INPUT}
     -DOUTPUT=${FONT_HEADER}
-    -DARRAY_NAME=font_jetbrains_mono
+    -DARRAY_NAME=font_monaspace_argon
     -P ${CMAKE_SOURCE_DIR}/bin2header.cmake
   DEPENDS "${FONT_INPUT}" "${CMAKE_SOURCE_DIR}/bin2header.cmake"
-  COMMENT "Generating font_jetbrains_mono.h"
+  COMMENT "Generating font_monaspace_argon.h"
+)
+
+set(ITALIC_FONT_INPUT "${CMAKE_SOURCE_DIR}/fonts/MonaspaceArgonFrozen-Italic.ttf")
+set(ITALIC_FONT_HEADER "${CMAKE_BINARY_DIR}/font_monaspace_argon_italic.h")
+add_custom_command(
+  OUTPUT "${ITALIC_FONT_HEADER}"
+  COMMAND ${CMAKE_COMMAND}
+    -DINPUT=${ITALIC_FONT_INPUT}
+    -DOUTPUT=${ITALIC_FONT_HEADER}
+    -DARRAY_NAME=font_monaspace_argon_italic
+    -P ${CMAKE_SOURCE_DIR}/bin2header.cmake
+  DEPENDS "${ITALIC_FONT_INPUT}" "${CMAKE_SOURCE_DIR}/bin2header.cmake"
+  COMMENT "Generating font_monaspace_argon_italic.h"
 )
 
 # --- Our Project -------------------------------------------------------------
-add_executable(${PROJECT_NAME} main.c "${FONT_HEADER}")
+add_executable(${PROJECT_NAME} main.c "${FONT_HEADER}" "${ITALIC_FONT_HEADER}")
 target_compile_features(${PROJECT_NAME} PRIVATE c_std_11)
 target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_BINARY_DIR}")
 target_link_libraries(${PROJECT_NAME} raylib ghostty-vt)
