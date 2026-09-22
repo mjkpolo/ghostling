@@ -120,7 +120,7 @@ For a headless server build on another machine, clone with submodules and run:
 ```sh
 mkdir -p "$HOME/codex_projects"
 cd "$HOME/codex_projects"
-git clone --recurse-submodules -b gmux-codex https://github.com/mjkpolo/ghostling.git
+git clone --recurse-submodules -b gmux-codex git@github.com:mjkpolo/ghostling.git
 cd ghostling
 ./build.sh --server-only
 ```
