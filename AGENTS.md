@@ -41,9 +41,9 @@
 - Motivation: avoid the extra terminal-emulation and escape-sequence translation
   layer between a traditional multiplexer and its host terminal, including their
   differing terminfo/capability expectations. Retain the benefits of multiplexing.
-- This is currently an architectural direction, not an implemented remote system.
-  Protocol, transport, session management, and pane-layout details are undecided.
-  Distinguish user requirements from implementation proposals in future work.
+- The current prototype has separate `gmux` GUI and persistent `gmux-server`
+  binaries communicating over a Unix socket. SSH Unix-socket forwarding is the
+  proposed remote transport; pane-layout details are undecided.
 - Keep new tools, dependencies, and caches inside `~/codex_projects`. Zig 0.16.0
   is installed at `../zig-0.16.0/zig`; use it rather than the older Zig on PATH.
   Set `ZIG_GLOBAL_CACHE_DIR=/home/ma148697/codex_projects/.cache/zig` and
@@ -60,7 +60,9 @@
 
 ## Building
 
-- Requires CMake 3.19+, Ninja, a C compiler, and Zig 0.16.x on PATH
+- `./build.sh` fetches Zig 0.16.0 into `~/codex_projects` when absent and
+  builds both binaries. `./build.sh --server-only` skips Raylib and builds only
+  `gmux-server` for a headless machine.
 
 ## Live GUI Testing Under Sway/XWayland
 
@@ -89,12 +91,14 @@
 - Configure: `cmake -B build -G Ninja`
 - Build: `cmake --build build`
 - Release build: `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release`
-- Run: `./build/ghostling`
+- Run: `./build/gmux-server "$HOME/.gmux.sock"` then
+  `./build/gmux --connect "$HOME/.gmux.sock"`
 - Clean: `cmake --build build --target clean`
 
 ## Code Conventions
 
-- C (not C++), single-file project in `main.c`
+- C (not C++); `gmux_client.c` and `gmux_server.c` include shared protocol and
+  process-specific code from `gmux_core.c`.
 - Never put side-effect calls inside `assert()` — removed in release builds
 - Comment heavily — explain *why*, not just *what*
 

@@ -105,15 +105,30 @@ Requirements:
 - [CMake](https://cmake.org/) 3.19+
 - [Ninja](https://ninja-build.org/)
 - A C compiler
-- [Zig](https://ziglang.org/) 0.16.x on PATH
+- `curl`, `sha256sum`, and `tar` for `./build.sh` to fetch Zig 0.16.0
 - macOS: [Command Line Tools or Xcode](https://developer.apple.com/xcode/)
 - Linux (Ubuntu/Debian): `sudo apt install -y ninja-build build-essential git libxinerama-dev libxcursor-dev libxrandr-dev libxi-dev libxext-dev libx11-dev libgl-dev`
 
 ```sh
-cmake -B build -G Ninja
-cmake --build build
-./build/ghostling
+./build.sh
+./build/gmux-server "$HOME/.gmux.sock"
+./build/gmux --connect "$HOME/.gmux.sock"
 ```
+
+For a headless server build on another machine, clone with submodules and run:
+
+```sh
+mkdir -p "$HOME/codex_projects"
+cd "$HOME/codex_projects"
+git clone --recurse-submodules -b gmux-codex https://github.com/mjkpolo/ghostling.git
+cd ghostling
+./build.sh --server-only
+```
+
+The script downloads checksum-verified Zig 0.16.0 into the parent directory of
+the checkout when it is absent. The server embeds libghostty-vt and MessagePack,
+but uses the build system's glibc and libm dynamically. Build on a glibc 2.34
+system to target glibc 2.34.
 
 > [!WARNING]
 >
