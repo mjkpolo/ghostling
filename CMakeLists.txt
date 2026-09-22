@@ -41,6 +41,15 @@ FetchContent_Declare(ghostty
 )
 FetchContent_MakeAvailable(ghostty)
 
+# --- MessagePack -------------------------------------------------------------
+# Vendored as a Git submodule so the exact C implementation is visible and
+# pinned with the rest of the project.
+set(MSGPACK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(MSGPACK_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(MSGPACK_ENABLE_SHARED OFF CACHE BOOL "" FORCE)
+set(MSGPACK_ENABLE_STATIC ON CACHE BOOL "" FORCE)
+add_subdirectory(vendor/msgpack-c)
+
 # --- Embed font as a C header ------------------------------------------------
 # Convert the TTF font into a C byte-array header so we don't rely on C23
 # #embed (which GCC < 15 doesn't support).
@@ -74,7 +83,7 @@ add_custom_command(
 add_executable(${PROJECT_NAME} main.c "${FONT_HEADER}" "${ITALIC_FONT_HEADER}")
 target_compile_features(${PROJECT_NAME} PRIVATE c_std_11)
 target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_BINARY_DIR}")
-target_link_libraries(${PROJECT_NAME} raylib ghostty-vt)
+target_link_libraries(${PROJECT_NAME} raylib ghostty-vt msgpack-c)
 
 # macOS requires these system frameworks for raylib's windowing/input/rendering.
 if (APPLE)

@@ -9,6 +9,8 @@
 - Whenever Codex materially writes code and creates or amends the corresponding
   commit, ALWAYS include this exact Git commit trailer:
   `Co-authored-by: Codex <noreply@openai.com>`.
+- NEVER push commits or branches unless the user explicitly tells you to push.
+  Permission to edit, build, test, or commit does not imply permission to push.
 - Survey prior art before treating an architectural idea as novel. Study who has
   tried related designs, what they actually transmit, and their tradeoffs. Do not
   assume the idea has never been implemented, or invent reasons for adoption.
@@ -48,6 +50,10 @@
   `ZIG_LOCAL_CACHE_DIR=/home/ma148697/codex_projects/ghostling/build/.zig-cache`.
 - The current prototype embeds Monaspace Argon Frozen Regular and Italic at size
   24 and loads all 953 Unicode characters mapped by these bundled font files.
+- Keep the dirty-frame render cache disabled until the repeated Kitty-image
+  transition test is understood and fixed. The comparison renderer should draw
+  terminal and Kitty state every frame; do not reintroduce the cache merely
+  because text-only transitions pass.
 - The user runs Sway and remaps Caps Lock to Ctrl through XKB. This prototype
   currently uses GLFW's X11 backend through XWayland. The remapping reportedly
   fails in Ghostling; the backend is confirmed, but the cause is not diagnosed.
@@ -55,6 +61,31 @@
 ## Building
 
 - Requires CMake 3.19+, Ninja, a C compiler, and Zig 0.16.x on PATH
+
+## Live GUI Testing Under Sway/XWayland
+
+- A useful end-to-end renderer test is to launch Ghostling with `SHELL` set to a
+  temporary executable script. The script can print deterministic ANSI/VT test
+  output and then remain alive. This exercises the real PTY -> libghostty ->
+  Raylib path without depending on interactive keyboard injection.
+- Include representative regular, italic, bold, truecolor, box-drawing, symbol,
+  and Powerline output. Put literal UTF-8 characters in a POSIX shell script;
+  portable `printf` does not interpret `\uXXXX` escapes.
+- Ghostling currently appears to Sway as an XWayland window. Locate it with
+  `swaymsg -t get_tree` for compositor metadata or `xwininfo -root -tree` for
+  its X11 window ID. `import -window <xid> screenshot.png` captures only that
+  window and worked when `grim` could not copy the relevant output.
+- To check cached clean-frame rendering, capture the idle window twice several
+  seconds apart, compare SHA-256 hashes, and use ImageMagick
+  `compare -metric AE first.png second.png null:`. Matching hashes and an
+  absolute-error result of zero prove that the displayed idle frames are
+  pixel-identical. This validates persistence of the cached surface; it does not
+  by itself measure how many libghostty calls occurred.
+- Load or display the resulting screenshot for visual inspection. Check actual
+  glyph shapes and styling rather than treating process startup as sufficient
+  proof. Clearly distinguish renderer failures from mistakes in the test script.
+- Close the temporary Ghostling process after capturing evidence and keep test
+  scripts/screenshots outside the repository unless the user asks to retain them.
 - Configure: `cmake -B build -G Ninja`
 - Build: `cmake --build build`
 - Release build: `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release`
