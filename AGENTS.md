@@ -54,29 +54,28 @@
   transition test is understood and fixed. The comparison renderer should draw
   terminal and Kitty state every frame; do not reintroduce the cache merely
   because text-only transitions pass.
-- The user runs Sway and remaps Caps Lock to Ctrl through XKB. This prototype
-  currently uses GLFW's X11 backend through XWayland. The remapping reportedly
-  fails in Ghostling; the backend is confirmed, but the cause is not diagnosed.
+- The user runs Sway and remaps Caps Lock to Ctrl through XKB. The client is
+  migrating from Raylib/GLFW/XWayland to GTK4/GDK. The first GTK build was
+  confirmed by Sway as a native Wayland `xdg_shell` surface.
 
 ## Building
 
 - `./build.sh` fetches Zig 0.16.0 into `~/codex_projects` when absent and
-  builds both binaries. `./build.sh --server-only` skips Raylib and builds only
+  builds both binaries. `./build.sh --server-only` skips GTK and builds only
   `gmux-server` for a headless machine.
 
-## Live GUI Testing Under Sway/XWayland
+## Live GUI Testing Under Sway
 
 - A useful end-to-end renderer test is to launch Ghostling with `SHELL` set to a
   temporary executable script. The script can print deterministic ANSI/VT test
   output and then remain alive. This exercises the real PTY -> libghostty ->
-  Raylib path without depending on interactive keyboard injection.
+  GTK/Cairo path without depending on interactive keyboard injection.
 - Include representative regular, italic, bold, truecolor, box-drawing, symbol,
   and Powerline output. Put literal UTF-8 characters in a POSIX shell script;
   portable `printf` does not interpret `\uXXXX` escapes.
-- Ghostling currently appears to Sway as an XWayland window. Locate it with
-  `swaymsg -t get_tree` for compositor metadata or `xwininfo -root -tree` for
-  its X11 window ID. `import -window <xid> screenshot.png` captures only that
-  window and worked when `grim` could not copy the relevant output.
+- Locate the window with `swaymsg -t get_tree`. A native build reports
+  `app_id: org.ghostty.gmux` and `shell: xdg_shell`; an XWayland regression has
+  a non-null X11 window id instead.
 - To check cached clean-frame rendering, capture the idle window twice several
   seconds apart, compare SHA-256 hashes, and use ImageMagick
   `compare -metric AE first.png second.png null:`. Matching hashes and an

@@ -21,7 +21,10 @@
 #endif
 
 #ifdef GMUX_CLIENT
-#include "raylib.h"
+#include <fontconfig/fontconfig.h>
+#include <gtk/gtk.h>
+#include <glib-unix.h>
+#include <gdk/gdkkeysyms.h>
 #endif
 #include <ghostty/vt.h>
 #include <msgpack.h>
@@ -654,95 +657,64 @@ fail:
 }
 
 #ifdef GMUX_CLIENT
-// Map a raylib key constant to a GhosttyKey code.
-// Returns GHOSTTY_KEY_UNIDENTIFIED for keys we don't handle.
-static GhosttyKey raylib_key_to_ghostty(int rl_key)
+// Map GDK's layout-aware key value to libghostty's semantic key identity.
+// The server retains responsibility for choosing legacy or Kitty encoding.
+static GhosttyKey gdk_key_to_ghostty(guint keyval)
 {
-    // Letters — raylib KEY_A..KEY_Z are contiguous, and so are
-    // GHOSTTY_KEY_A..GHOSTTY_KEY_Z.
-    if (rl_key >= KEY_A && rl_key <= KEY_Z)
-        return GHOSTTY_KEY_A + (rl_key - KEY_A);
+    guint lower = gdk_keyval_to_lower(keyval);
+    if (lower >= GDK_KEY_a && lower <= GDK_KEY_z)
+        return GHOSTTY_KEY_A + (lower - GDK_KEY_a);
+    if (keyval >= GDK_KEY_0 && keyval <= GDK_KEY_9)
+        return GHOSTTY_KEY_DIGIT_0 + (keyval - GDK_KEY_0);
+    if (keyval >= GDK_KEY_F1 && keyval <= GDK_KEY_F12)
+        return GHOSTTY_KEY_F1 + (keyval - GDK_KEY_F1);
 
-    // Digits — raylib KEY_ZERO..KEY_NINE are contiguous.
-    if (rl_key >= KEY_ZERO && rl_key <= KEY_NINE)
-        return GHOSTTY_KEY_DIGIT_0 + (rl_key - KEY_ZERO);
-
-    // Function keys — raylib KEY_F1..KEY_F12 are contiguous.
-    if (rl_key >= KEY_F1 && rl_key <= KEY_F12)
-        return GHOSTTY_KEY_F1 + (rl_key - KEY_F1);
-
-    switch (rl_key) {
-    case KEY_SPACE:       return GHOSTTY_KEY_SPACE;
-    case KEY_ENTER:       return GHOSTTY_KEY_ENTER;
-    case KEY_TAB:         return GHOSTTY_KEY_TAB;
-    case KEY_BACKSPACE:   return GHOSTTY_KEY_BACKSPACE;
-    case KEY_DELETE:      return GHOSTTY_KEY_DELETE;
-    case KEY_ESCAPE:      return GHOSTTY_KEY_ESCAPE;
-    case KEY_UP:          return GHOSTTY_KEY_ARROW_UP;
-    case KEY_DOWN:        return GHOSTTY_KEY_ARROW_DOWN;
-    case KEY_LEFT:        return GHOSTTY_KEY_ARROW_LEFT;
-    case KEY_RIGHT:       return GHOSTTY_KEY_ARROW_RIGHT;
-    case KEY_HOME:        return GHOSTTY_KEY_HOME;
-    case KEY_END:         return GHOSTTY_KEY_END;
-    case KEY_PAGE_UP:     return GHOSTTY_KEY_PAGE_UP;
-    case KEY_PAGE_DOWN:   return GHOSTTY_KEY_PAGE_DOWN;
-    case KEY_INSERT:      return GHOSTTY_KEY_INSERT;
-    case KEY_MINUS:       return GHOSTTY_KEY_MINUS;
-    case KEY_EQUAL:       return GHOSTTY_KEY_EQUAL;
-    case KEY_LEFT_BRACKET:  return GHOSTTY_KEY_BRACKET_LEFT;
-    case KEY_RIGHT_BRACKET: return GHOSTTY_KEY_BRACKET_RIGHT;
-    case KEY_BACKSLASH:   return GHOSTTY_KEY_BACKSLASH;
-    case KEY_SEMICOLON:   return GHOSTTY_KEY_SEMICOLON;
-    case KEY_APOSTROPHE:  return GHOSTTY_KEY_QUOTE;
-    case KEY_COMMA:       return GHOSTTY_KEY_COMMA;
-    case KEY_PERIOD:      return GHOSTTY_KEY_PERIOD;
-    case KEY_SLASH:       return GHOSTTY_KEY_SLASH;
-    case KEY_GRAVE:       return GHOSTTY_KEY_BACKQUOTE;
+    switch (keyval) {
+    case GDK_KEY_space:       return GHOSTTY_KEY_SPACE;
+    case GDK_KEY_Return:
+    case GDK_KEY_KP_Enter:    return GHOSTTY_KEY_ENTER;
+    case GDK_KEY_Tab:
+    case GDK_KEY_ISO_Left_Tab:return GHOSTTY_KEY_TAB;
+    case GDK_KEY_BackSpace:   return GHOSTTY_KEY_BACKSPACE;
+    case GDK_KEY_Delete:      return GHOSTTY_KEY_DELETE;
+    case GDK_KEY_Escape:      return GHOSTTY_KEY_ESCAPE;
+    case GDK_KEY_Up:          return GHOSTTY_KEY_ARROW_UP;
+    case GDK_KEY_Down:        return GHOSTTY_KEY_ARROW_DOWN;
+    case GDK_KEY_Left:        return GHOSTTY_KEY_ARROW_LEFT;
+    case GDK_KEY_Right:       return GHOSTTY_KEY_ARROW_RIGHT;
+    case GDK_KEY_Home:        return GHOSTTY_KEY_HOME;
+    case GDK_KEY_End:         return GHOSTTY_KEY_END;
+    case GDK_KEY_Page_Up:     return GHOSTTY_KEY_PAGE_UP;
+    case GDK_KEY_Page_Down:   return GHOSTTY_KEY_PAGE_DOWN;
+    case GDK_KEY_Insert:      return GHOSTTY_KEY_INSERT;
+    case GDK_KEY_minus:       return GHOSTTY_KEY_MINUS;
+    case GDK_KEY_equal:       return GHOSTTY_KEY_EQUAL;
+    case GDK_KEY_bracketleft: return GHOSTTY_KEY_BRACKET_LEFT;
+    case GDK_KEY_bracketright:return GHOSTTY_KEY_BRACKET_RIGHT;
+    case GDK_KEY_backslash:   return GHOSTTY_KEY_BACKSLASH;
+    case GDK_KEY_semicolon:   return GHOSTTY_KEY_SEMICOLON;
+    case GDK_KEY_apostrophe:  return GHOSTTY_KEY_QUOTE;
+    case GDK_KEY_comma:       return GHOSTTY_KEY_COMMA;
+    case GDK_KEY_period:      return GHOSTTY_KEY_PERIOD;
+    case GDK_KEY_slash:       return GHOSTTY_KEY_SLASH;
+    case GDK_KEY_grave:       return GHOSTTY_KEY_BACKQUOTE;
     default:              return GHOSTTY_KEY_UNIDENTIFIED;
     }
 }
 
-// Build a GhosttyMods bitmask from the current raylib modifier key state.
-static GhosttyMods get_ghostty_mods(void)
+static GhosttyMods gdk_mods(GdkModifierType state)
 {
     GhosttyMods mods = 0;
-    if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT))
-        mods |= GHOSTTY_MODS_SHIFT;
-    if (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL))
-        mods |= GHOSTTY_MODS_CTRL;
-    if (IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT))
-        mods |= GHOSTTY_MODS_ALT;
-    if (IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER))
-        mods |= GHOSTTY_MODS_SUPER;
+    if (state & GDK_SHIFT_MASK) mods |= GHOSTTY_MODS_SHIFT;
+    if (state & GDK_CONTROL_MASK) mods |= GHOSTTY_MODS_CTRL;
+    if (state & GDK_ALT_MASK) mods |= GHOSTTY_MODS_ALT;
+    if (state & (GDK_SUPER_MASK | GDK_META_MASK)) mods |= GHOSTTY_MODS_SUPER;
     return mods;
 }
 
-// Return the unshifted Unicode codepoint for a raylib key, i.e. the
-// character the key produces with no modifiers on a US layout.  The
-// Kitty keyboard protocol requires this to identify keys.  Returns 0
-// for keys that don't have a natural codepoint (arrows, F-keys, etc.).
-static uint32_t raylib_key_unshifted_codepoint(int rl_key)
+static uint32_t gdk_unshifted_codepoint(guint keyval)
 {
-    if (rl_key >= KEY_A && rl_key <= KEY_Z)
-        return 'a' + (uint32_t)(rl_key - KEY_A);
-    if (rl_key >= KEY_ZERO && rl_key <= KEY_NINE)
-        return '0' + (uint32_t)(rl_key - KEY_ZERO);
-
-    switch (rl_key) {
-    case KEY_SPACE:          return ' ';
-    case KEY_MINUS:          return '-';
-    case KEY_EQUAL:          return '=';
-    case KEY_LEFT_BRACKET:   return '[';
-    case KEY_RIGHT_BRACKET:  return ']';
-    case KEY_BACKSLASH:      return '\\';
-    case KEY_SEMICOLON:      return ';';
-    case KEY_APOSTROPHE:     return '\'';
-    case KEY_COMMA:          return ',';
-    case KEY_PERIOD:         return '.';
-    case KEY_SLASH:          return '/';
-    case KEY_GRAVE:          return '`';
-    default:                 return 0;
-    }
+    return gdk_keyval_to_unicode(gdk_keyval_to_lower(keyval));
 }
 
 #endif
@@ -783,6 +755,7 @@ static int utf8_encode(uint32_t cp, char out[4])
 }
 
 #ifdef GMUX_CLIENT
+#if 0 /* Replaced by GDK event-controller callbacks near run_client. */
 // Map a raylib mouse button to a GhosttyMouseButton.
 static GhosttyMouseButton raylib_mouse_to_ghostty(int rl_button)
 {
@@ -978,6 +951,7 @@ static void collect_input(InputWire *wire)
         input_append(wire, INPUT_KEY, &message, sizeof(message));
     }
 }
+#endif
 
 #endif
 #ifdef GMUX_SERVER
@@ -1135,6 +1109,7 @@ static bool apply_input_wire(InputWire *wire, int pty_fd,
 
 #endif
 #ifdef GMUX_CLIENT
+#if 0 /* Raylib texture lifetime support; GTK draws from the snapshot. */
 // Deferred texture cleanup — textures uploaded during a frame can't be
 // freed until after EndDrawing() flushes the draw commands to the GPU.
 #define MAX_DEFERRED_TEXTURES 256
@@ -1155,7 +1130,7 @@ static void flush_deferred_textures(void)
         UnloadTexture(deferred_textures[i]);
     deferred_texture_count = 0;
 }
-
+#endif
 
 #endif
 // Semantic render snapshot. The producer copies libghostty's render values;
@@ -1518,10 +1493,12 @@ static SnapshotRgb snapshot_rgb(GhosttyColorRgb color)
 
 #endif
 #ifdef GMUX_CLIENT
+#if 0 /* Raylib color conversion; Cairo consumes SnapshotRgb directly. */
 static Color snapshot_color(SnapshotRgb color, uint8_t alpha)
 {
     return (Color){ color.r, color.g, color.b, alpha };
 }
+#endif
 
 #endif
 static bool snapshot_append(RenderSnapshotWire *wire,
@@ -1858,7 +1835,8 @@ static void render_client_apply(RenderClientState *client,
     }
 }
 
-static void apply_snapshot_title(const RenderSnapshotWire *wire)
+static void apply_snapshot_title(GtkWindow *window,
+                                 const RenderSnapshotWire *wire)
 {
     size_t offset = 0;
     while (offset + sizeof(SnapshotRecord) <= wire->len) {
@@ -1873,7 +1851,7 @@ static void apply_snapshot_title(const RenderSnapshotWire *wire)
                 ? record.size : sizeof(title) - 1;
             memcpy(title, wire->data + offset, len);
             title[len] = '\0';
-            SetWindowTitle(title);
+            gtk_window_set_title(window, title);
         }
         offset += record.size;
     }
@@ -1887,6 +1865,7 @@ static void render_client_free(RenderClientState *client)
     *client = (RenderClientState){0};
 }
 
+#if 0 /* Superseded by the Cairo/Pango renderer below. */
 static void render_snapshot_images(
     const RenderSnapshotWire *wire, GhosttyKittyPlacementLayer layer,
     int cell_width, int cell_height, int pad)
@@ -1993,6 +1972,160 @@ static void render_snapshot(const RenderClientState *client,
         DrawRectangle(GetScreenWidth() - 8, thumb_y, 6, thumb_height,
                       (Color){200, 200, 200, 128});
     }
+}
+#endif
+
+static void cairo_color(cairo_t *cr, SnapshotRgb color, double alpha)
+{
+    cairo_set_source_rgba(cr, color.r / 255.0, color.g / 255.0,
+                         color.b / 255.0, alpha);
+}
+
+static void cairo_snapshot_cells(cairo_t *cr,
+                                 const RenderClientState *client,
+                                 PangoLayout *layout,
+                                 PangoFontDescription *regular,
+                                 PangoFontDescription *italic,
+                                 int cell_width, int cell_height,
+                                 int pad, bool text_pass)
+{
+    for (uint16_t row = 0; row < client->row_count; row++) {
+        const CachedRow *cached = &client->rows[row];
+        for (uint16_t i = 0; i < cached->cell_count; i++) {
+            const SnapshotCell *cell = &cached->cells[i];
+            double x = pad + cell->col * cell_width;
+            double y = pad + row * cell_height;
+            if (!text_pass && cell->has_background) {
+                cairo_color(cr, cell->background, 1.0);
+                cairo_rectangle(cr, x, y, cell_width, cell_height);
+                cairo_fill(cr);
+            } else if (text_pass && cell->has_text) {
+                pango_layout_set_font_description(
+                    layout, cell->italic ? italic : regular);
+                pango_layout_set_text(layout, cell->text, -1);
+                cairo_color(cr, cell->foreground, 1.0);
+                cairo_move_to(cr, x, y);
+                pango_cairo_show_layout(cr, layout);
+                if (cell->bold) {
+                    cairo_move_to(cr, x + 1, y);
+                    pango_cairo_show_layout(cr, layout);
+                }
+            }
+        }
+    }
+}
+
+// Convert libghostty's RGBA pixels to Cairo's native premultiplied ARGB32.
+// This is intentionally a correctness-first bridge; a later GTK-hosted GPU
+// renderer can cache/upload images without changing the wire representation.
+static void cairo_snapshot_images(cairo_t *cr,
+                                  const RenderSnapshotWire *wire,
+                                  GhosttyKittyPlacementLayer layer,
+                                  int cell_width, int cell_height, int pad)
+{
+    size_t offset = 0;
+    while (offset + sizeof(SnapshotRecord) <= wire->len) {
+        SnapshotRecord record;
+        memcpy(&record, wire->data + offset, sizeof(record));
+        offset += sizeof(record);
+        if (offset + record.size > wire->len) return;
+        if (record.kind == SNAPSHOT_IMAGE
+            && record.size >= sizeof(SnapshotImage)) {
+            SnapshotImage image;
+            memcpy(&image, wire->data + offset, sizeof(image));
+            const uint8_t *rgba = wire->data + offset + sizeof(image);
+            size_t pixels = (size_t)image.image_w * image.image_h;
+            if (image.layer == (int32_t)layer
+                && image.src_w && image.src_h
+                && sizeof(image) + image.pixel_len <= record.size
+                && image.pixel_len >= pixels * 4) {
+                int stride = cairo_format_stride_for_width(
+                    CAIRO_FORMAT_ARGB32, (int)image.image_w);
+                uint8_t *argb = calloc((size_t)stride, image.image_h);
+                if (argb) {
+                    for (uint32_t y = 0; y < image.image_h; y++) {
+                        uint32_t *dst = (uint32_t *)(argb + (size_t)y * stride);
+                        for (uint32_t x = 0; x < image.image_w; x++) {
+                            const uint8_t *src = rgba + ((size_t)y * image.image_w + x) * 4;
+                            uint32_t a = src[3];
+                            dst[x] = (a << 24)
+                                | ((src[0] * a / 255) << 16)
+                                | ((src[1] * a / 255) << 8)
+                                | (src[2] * a / 255);
+                        }
+                    }
+                    cairo_surface_t *surface = cairo_image_surface_create_for_data(
+                        argb, CAIRO_FORMAT_ARGB32, image.image_w,
+                        image.image_h, stride);
+                    double dx = pad + image.viewport_col * cell_width + image.x_offset;
+                    double dy = pad + image.viewport_row * cell_height + image.y_offset;
+                    double dw = image.grid_cols * cell_width;
+                    double dh = image.grid_rows * cell_height;
+                    cairo_save(cr);
+                    cairo_rectangle(cr, dx, dy, dw, dh);
+                    cairo_clip(cr);
+                    cairo_translate(cr, dx, dy);
+                    cairo_scale(cr, dw / image.src_w, dh / image.src_h);
+                    cairo_set_source_surface(cr, surface,
+                                             -(double)image.src_x,
+                                             -(double)image.src_y);
+                    cairo_pattern_set_filter(cairo_get_source(cr),
+                                             CAIRO_FILTER_BILINEAR);
+                    cairo_paint(cr);
+                    cairo_restore(cr);
+                    cairo_surface_destroy(surface);
+                    free(argb);
+                }
+            }
+        }
+        offset += record.size;
+    }
+}
+
+static void cairo_render_snapshot(cairo_t *cr,
+                                  const RenderClientState *client,
+                                  const RenderSnapshotWire *wire,
+                                  PangoFontDescription *regular,
+                                  PangoFontDescription *italic,
+                                  int cell_width, int cell_height,
+                                  int pad, int width, int height)
+{
+    const SnapshotHeader *header = &client->header;
+    cairo_color(cr, header->background, 1.0);
+    cairo_paint(cr);
+    PangoLayout *layout = pango_cairo_create_layout(cr);
+
+    cairo_snapshot_images(cr, wire, GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_BG,
+                          cell_width, cell_height, pad);
+    cairo_snapshot_cells(cr, client, layout, regular, italic,
+                         cell_width, cell_height, pad, false);
+    cairo_snapshot_images(cr, wire, GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_TEXT,
+                          cell_width, cell_height, pad);
+    cairo_snapshot_cells(cr, client, layout, regular, italic,
+                         cell_width, cell_height, pad, true);
+    if (header->cursor_visible) {
+        cairo_color(cr, header->cursor_color, 0.5);
+        cairo_rectangle(cr, pad + header->cursor_col * cell_width,
+                        pad + header->cursor_row * cell_height,
+                        cell_width, cell_height);
+        cairo_fill(cr);
+    }
+    cairo_snapshot_images(cr, wire, GHOSTTY_KITTY_PLACEMENT_LAYER_ABOVE_TEXT,
+                          cell_width, cell_height, pad);
+
+    if (header->scrollbar_visible
+        && header->scrollbar_total > header->scrollbar_len) {
+        int thumb_height = (int)(height
+            * ((double)header->scrollbar_len / header->scrollbar_total));
+        if (thumb_height < 10) thumb_height = 10;
+        double fraction = (double)header->scrollbar_offset
+            / (header->scrollbar_total - header->scrollbar_len);
+        cairo_set_source_rgba(cr, 0.78, 0.78, 0.78, 0.5);
+        cairo_rectangle(cr, width - 8,
+                        fraction * (height - thumb_height), 6, thumb_height);
+        cairo_fill(cr);
+    }
+    g_object_unref(layout);
 }
 
 #endif
@@ -2139,6 +2272,7 @@ static bool effect_color_scheme(GhosttyTerminal terminal, void *userdata,
 // Main
 // ---------------------------------------------------------------------------
 
+#if 0 /* Raylib font atlas generation; Pango uses app-registered font files. */
 // Raylib's convenience loader assumes glyphs are no taller than font_size.
 // Box-drawing and Powerline symbols can exceed that height. Pack the original
 // glyph images using their actual bounds so neighboring atlas rows stay apart.
@@ -2171,6 +2305,7 @@ static Font load_terminal_font(const unsigned char *data, int data_size,
     }
     return font;
 }
+#endif
 
 #endif
 #ifdef GMUX_SERVER
@@ -2489,7 +2624,8 @@ cleanup:
     return result;
 }
 
-static int run_client(int socket_fd)
+#if 0 /* Replaced by the event-driven GTK client below. */
+static int run_client_raylib(int socket_fd)
 {
     int result = 1;
     WireConnection connection = { .fd = -1 };
@@ -2722,6 +2858,370 @@ cleanup:
     UnloadFont(italic_font);
     UnloadFont(mono_font);
     CloseWindow();
+    return result;
+}
+#endif
+
+typedef struct {
+    GtkApplication *application;
+    GtkWindow *window;
+    GtkWidget *area;
+    WireConnection connection;
+    InputWire input;
+    RenderSnapshotWire snapshot;
+    RenderClientState render;
+    PangoFontDescription *regular;
+    PangoFontDescription *italic;
+    int cell_width, cell_height;
+    int width, height;
+    int pad;
+    double mouse_x, mouse_y;
+    guint mouse_buttons;
+    bool keys[256];
+    guint socket_source;
+} GtkClient;
+
+static bool gtk_client_send(GtkClient *client, InputKind kind,
+                            const void *payload, size_t size)
+{
+    return input_append(&client->input, kind, payload, size)
+        && input_queue(&client->connection, &client->input)
+        && wire_flush(&client->connection);
+}
+
+static bool register_embedded_font(const unsigned char *data, size_t len)
+{
+    char path[] = "/tmp/gmux-font-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) return false;
+    const unsigned char *cursor = data;
+    size_t remaining = len;
+    while (remaining) {
+        ssize_t written = write(fd, cursor, remaining);
+        if (written > 0) {
+            cursor += written;
+            remaining -= (size_t)written;
+        } else if (written < 0 && errno == EINTR) {
+            continue;
+        } else {
+            close(fd);
+            unlink(path);
+            return false;
+        }
+    }
+    close(fd);
+    bool ok = FcConfigAppFontAddFile(NULL, (const FcChar8 *)path);
+    unlink(path);
+    return ok;
+}
+
+static GhosttyMouseButton gtk_mouse_button(guint button)
+{
+    switch (button) {
+    case 1: return GHOSTTY_MOUSE_BUTTON_LEFT;
+    case 2: return GHOSTTY_MOUSE_BUTTON_MIDDLE;
+    case 3: return GHOSTTY_MOUSE_BUTTON_RIGHT;
+    case 8: return GHOSTTY_MOUSE_BUTTON_FOUR;
+    case 9: return GHOSTTY_MOUSE_BUTTON_FIVE;
+    default: return GHOSTTY_MOUSE_BUTTON_UNKNOWN;
+    }
+}
+
+static GdkModifierType gtk_current_mods(GtkEventController *controller)
+{
+    return gtk_event_controller_get_current_event_state(controller);
+}
+
+static gboolean gtk_key_pressed(GtkEventControllerKey *controller,
+                                guint keyval, guint keycode,
+                                GdkModifierType state, gpointer userdata)
+{
+    GtkClient *client = userdata;
+    InputKey message = {
+        .key = gdk_key_to_ghostty(keyval),
+        .action = keycode < 256 && client->keys[keycode]
+            ? GHOSTTY_KEY_ACTION_REPEAT : GHOSTTY_KEY_ACTION_PRESS,
+        .mods = gdk_mods(state),
+        .unshifted_codepoint = gdk_unshifted_codepoint(keyval),
+    };
+    GdkEvent *event = gtk_event_controller_get_current_event(
+        GTK_EVENT_CONTROLLER(controller));
+    if (event)
+        message.consumed_mods = gdk_mods(
+            gdk_key_event_get_consumed_modifiers(event));
+    gunichar codepoint = gdk_keyval_to_unicode(keyval);
+    if (codepoint && !(state & (GDK_CONTROL_MASK | GDK_ALT_MASK))) {
+        int len = g_unichar_to_utf8(codepoint, message.text);
+        if (len > 0) message.text_len = (uint8_t)len;
+    }
+    if (keycode < 256) client->keys[keycode] = true;
+    gtk_client_send(client, INPUT_KEY, &message, sizeof(message));
+    return TRUE;
+}
+
+static void gtk_key_released(GtkEventControllerKey *controller,
+                             guint keyval, guint keycode,
+                             GdkModifierType state, gpointer userdata)
+{
+    (void)controller;
+    GtkClient *client = userdata;
+    InputKey message = {
+        .key = gdk_key_to_ghostty(keyval),
+        .action = GHOSTTY_KEY_ACTION_RELEASE,
+        .mods = gdk_mods(state),
+        .unshifted_codepoint = gdk_unshifted_codepoint(keyval),
+    };
+    if (keycode < 256) client->keys[keycode] = false;
+    gtk_client_send(client, INPUT_KEY, &message, sizeof(message));
+}
+
+static void gtk_mouse_click(GtkGestureClick *gesture, int presses,
+                            double x, double y, gpointer userdata,
+                            GhosttyMouseAction action)
+{
+    (void)presses;
+    GtkClient *client = userdata;
+    guint button = gtk_gesture_single_get_current_button(
+        GTK_GESTURE_SINGLE(gesture));
+    GhosttyMouseButton ghostty_button = gtk_mouse_button(button);
+    if (ghostty_button == GHOSTTY_MOUSE_BUTTON_UNKNOWN) return;
+    if (action == GHOSTTY_MOUSE_ACTION_PRESS)
+        client->mouse_buttons |= 1u << (button < 31 ? button : 0);
+    else
+        client->mouse_buttons &= ~(1u << (button < 31 ? button : 0));
+    client->mouse_x = x;
+    client->mouse_y = y;
+    InputMouse message = {
+        .action = action,
+        .button = ghostty_button,
+        .mods = gdk_mods(gtk_current_mods(GTK_EVENT_CONTROLLER(gesture))),
+        .x = (float)x,
+        .y = (float)y,
+        .has_button = true,
+        .any_button_pressed = client->mouse_buttons != 0,
+    };
+    gtk_client_send(client, INPUT_MOUSE, &message, sizeof(message));
+}
+
+static void gtk_mouse_pressed(GtkGestureClick *gesture, int presses,
+                              double x, double y, gpointer userdata)
+{
+    gtk_mouse_click(gesture, presses, x, y, userdata,
+                    GHOSTTY_MOUSE_ACTION_PRESS);
+}
+
+static void gtk_mouse_released(GtkGestureClick *gesture, int presses,
+                               double x, double y, gpointer userdata)
+{
+    gtk_mouse_click(gesture, presses, x, y, userdata,
+                    GHOSTTY_MOUSE_ACTION_RELEASE);
+}
+
+static void gtk_mouse_motion(GtkEventControllerMotion *controller,
+                             double x, double y, gpointer userdata)
+{
+    GtkClient *client = userdata;
+    client->mouse_x = x;
+    client->mouse_y = y;
+    InputMouse message = {
+        .action = GHOSTTY_MOUSE_ACTION_MOTION,
+        .mods = gdk_mods(gtk_current_mods(GTK_EVENT_CONTROLLER(controller))),
+        .x = (float)x,
+        .y = (float)y,
+        .any_button_pressed = client->mouse_buttons != 0,
+    };
+    if (client->mouse_buttons & (1u << 1)) {
+        message.button = GHOSTTY_MOUSE_BUTTON_LEFT;
+        message.has_button = true;
+    } else if (client->mouse_buttons & (1u << 2)) {
+        message.button = GHOSTTY_MOUSE_BUTTON_MIDDLE;
+        message.has_button = true;
+    } else if (client->mouse_buttons & (1u << 3)) {
+        message.button = GHOSTTY_MOUSE_BUTTON_RIGHT;
+        message.has_button = true;
+    }
+    gtk_client_send(client, INPUT_MOUSE, &message, sizeof(message));
+}
+
+static gboolean gtk_mouse_scroll(GtkEventControllerScroll *controller,
+                                 double dx, double dy, gpointer userdata)
+{
+    (void)dx;
+    if (dy == 0) return FALSE;
+    GtkClient *client = userdata;
+    InputMouse message = {
+        .mods = gdk_mods(gtk_current_mods(GTK_EVENT_CONTROLLER(controller))),
+        .x = (float)client->mouse_x,
+        .y = (float)client->mouse_y,
+        .wheel = dy < 0 ? 1 : -1,
+        .any_button_pressed = client->mouse_buttons != 0,
+    };
+    gtk_client_send(client, INPUT_MOUSE, &message, sizeof(message));
+    return TRUE;
+}
+
+static void gtk_focus_changed(GtkWidget *widget, GParamSpec *spec,
+                              gpointer userdata)
+{
+    (void)spec;
+    GtkClient *client = userdata;
+    InputFocus focus = { .focused = gtk_widget_has_focus(widget) };
+    gtk_client_send(client, INPUT_FOCUS, &focus, sizeof(focus));
+}
+
+static void gtk_draw(GtkDrawingArea *area, cairo_t *cr,
+                     int width, int height, gpointer userdata)
+{
+    GtkClient *client = userdata;
+    if (width != client->width || height != client->height) {
+        client->width = width;
+        client->height = height;
+        int cols = (width - 2 * client->pad) / client->cell_width;
+        int rows = (height - 2 * client->pad) / client->cell_height;
+        if (cols < 1) cols = 1;
+        if (rows < 1) rows = 1;
+        InputResize resize = {
+            .cols = (uint16_t)cols,
+            .rows = (uint16_t)rows,
+            .cell_width = client->cell_width,
+            .cell_height = client->cell_height,
+            .screen_width = (uint32_t)width,
+            .screen_height = (uint32_t)height,
+            .padding = (uint32_t)client->pad,
+        };
+        gtk_client_send(client, INPUT_RESIZE, &resize, sizeof(resize));
+    }
+    cairo_render_snapshot(cr, &client->render, &client->snapshot,
+                          client->regular, client->italic,
+                          client->cell_width, client->cell_height,
+                          client->pad, width, height);
+    (void)area;
+}
+
+static gboolean gtk_socket_ready(gint fd, GIOCondition condition,
+                                 gpointer userdata)
+{
+    (void)fd;
+    GtkClient *client = userdata;
+    bool connected = !(condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL))
+        && wire_read(&client->connection);
+    while (connected) {
+        uint8_t *packed = NULL;
+        size_t packed_len = 0;
+        int frame = wire_take_frame(&client->connection, &packed, &packed_len);
+        if (frame == 0) break;
+        if (frame < 0
+            || !snapshot_decode(packed, packed_len, &client->snapshot)) {
+            connected = false;
+        } else {
+            render_client_apply(&client->render, &client->snapshot);
+            apply_snapshot_title(client->window, &client->snapshot);
+            gtk_widget_queue_draw(client->area);
+        }
+        free(packed);
+    }
+    if (!connected) {
+        client->socket_source = 0;
+        g_application_quit(G_APPLICATION(client->application));
+        return G_SOURCE_REMOVE;
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static gboolean gtk_close_requested(GtkWindow *window, gpointer userdata)
+{
+    (void)window;
+    GtkClient *client = userdata;
+    gtk_client_send(client, INPUT_DETACH, NULL, 0);
+    return FALSE;
+}
+
+static void gtk_activate(GtkApplication *application, gpointer userdata)
+{
+    GtkClient *client = userdata;
+    client->window = GTK_WINDOW(gtk_application_window_new(application));
+    gtk_window_set_title(client->window, "gmux");
+    gtk_window_set_default_size(client->window, 800, 600);
+
+    client->area = gtk_drawing_area_new();
+    gtk_widget_set_focusable(client->area, TRUE);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(client->area),
+                                   gtk_draw, client, NULL);
+    gtk_window_set_child(client->window, client->area);
+
+    PangoLayout *measure = gtk_widget_create_pango_layout(client->area, "M");
+    pango_layout_set_font_description(measure, client->regular);
+    pango_layout_get_pixel_size(measure, &client->cell_width,
+                                &client->cell_height);
+    g_object_unref(measure);
+    if (client->cell_width < 1) client->cell_width = 1;
+    if (client->cell_height < 1) client->cell_height = 1;
+
+    GtkEventController *key = gtk_event_controller_key_new();
+    g_signal_connect(key, "key-pressed", G_CALLBACK(gtk_key_pressed), client);
+    g_signal_connect(key, "key-released", G_CALLBACK(gtk_key_released), client);
+    gtk_widget_add_controller(client->area, key);
+
+    GtkGesture *click = gtk_gesture_click_new();
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click), 0);
+    g_signal_connect(click, "pressed", G_CALLBACK(gtk_mouse_pressed), client);
+    g_signal_connect(click, "released", G_CALLBACK(gtk_mouse_released), client);
+    gtk_widget_add_controller(client->area, GTK_EVENT_CONTROLLER(click));
+
+    GtkEventController *motion = gtk_event_controller_motion_new();
+    g_signal_connect(motion, "motion", G_CALLBACK(gtk_mouse_motion), client);
+    gtk_widget_add_controller(client->area, motion);
+
+    GtkEventController *scroll = gtk_event_controller_scroll_new(
+        GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
+    g_signal_connect(scroll, "scroll", G_CALLBACK(gtk_mouse_scroll), client);
+    gtk_widget_add_controller(client->area, scroll);
+
+    g_signal_connect(client->area, "notify::has-focus",
+                     G_CALLBACK(gtk_focus_changed), client);
+    g_signal_connect(client->window, "close-request",
+                     G_CALLBACK(gtk_close_requested), client);
+
+    client->socket_source = g_unix_fd_add(client->connection.fd,
+        G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL,
+        gtk_socket_ready, client);
+    gtk_client_send(client, INPUT_ATTACH, NULL, 0);
+    gtk_window_present(client->window);
+    gtk_widget_grab_focus(client->area);
+}
+
+static int run_client(int socket_fd)
+{
+    GtkClient client = { .connection.fd = -1, .pad = 4 };
+    if (!wire_connection_init(&client.connection, socket_fd)) {
+        close(socket_fd);
+        return 1;
+    }
+    FcInit();
+    if (!register_embedded_font(font_monaspace_argon,
+                                sizeof(font_monaspace_argon))
+        || !register_embedded_font(font_monaspace_argon_italic,
+                                   sizeof(font_monaspace_argon_italic))) {
+        fprintf(stderr, "failed to register embedded Monaspace fonts\n");
+    }
+    client.regular = pango_font_description_from_string(
+        "Monaspace Argon Frozen 24");
+    client.italic = pango_font_description_copy(client.regular);
+    pango_font_description_set_style(client.italic, PANGO_STYLE_ITALIC);
+    client.application = gtk_application_new("org.ghostty.gmux",
+                                              G_APPLICATION_DEFAULT_FLAGS);
+    g_signal_connect(client.application, "activate",
+                     G_CALLBACK(gtk_activate), &client);
+    int result = g_application_run(G_APPLICATION(client.application), 0, NULL);
+
+    if (client.socket_source) g_source_remove(client.socket_source);
+    render_client_free(&client.render);
+    free(client.input.data);
+    free(client.snapshot.data);
+    wire_connection_close(&client.connection);
+    pango_font_description_free(client.italic);
+    pango_font_description_free(client.regular);
+    g_object_unref(client.application);
     return result;
 }
 

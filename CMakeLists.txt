@@ -5,7 +5,7 @@ project(ghostling C)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(FetchContent)
-option(GMUX_BUILD_CLIENT "Build the Raylib client" ON)
+option(GMUX_BUILD_CLIENT "Build the GTK client" ON)
 
 # Ghostty's CMake wrapper caches ZIG_EXECUTABLE. When the flake changes the Zig
 # package, an existing build tree can otherwise keep using the old store path.
@@ -14,23 +14,11 @@ option(GMUX_BUILD_CLIENT "Build the Raylib client" ON)
 find_program(GHOSTLING_ZIG_EXECUTABLE zig REQUIRED NO_CACHE)
 set(ZIG_EXECUTABLE "${GHOSTLING_ZIG_EXECUTABLE}" CACHE FILEPATH "Path to the Zig compiler" FORCE)
 
-# --- Raylib ------------------------------------------------------------------
-# Use a system-installed raylib if available, otherwise fetch from GitHub.
+# --- GTK client --------------------------------------------------------------
 if (GMUX_BUILD_CLIENT)
-  set(RAYLIB_VERSION 5.5)
-  find_package(raylib ${RAYLIB_VERSION} QUIET)
-  if (NOT raylib_FOUND)
-    FetchContent_Declare(
-      raylib
-      DOWNLOAD_EXTRACT_TIMESTAMP OFF
-      URL https://github.com/raysan5/raylib/archive/refs/tags/${RAYLIB_VERSION}.tar.gz
-    )
-    FetchContent_GetProperties(raylib)
-    if (NOT raylib_POPULATED)
-      set(FETCHCONTENT_QUIET NO)
-      FetchContent_MakeAvailable(raylib)
-    endif()
-  endif()
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
+  pkg_check_modules(FONTCONFIG REQUIRED IMPORTED_TARGET fontconfig)
 endif()
 
 # --- libghostty-vt -----------------------------------------------------------
@@ -91,7 +79,7 @@ target_include_directories(gmux PRIVATE
   "${CMAKE_BINARY_DIR}"
   "${ghostty_SOURCE_DIR}/include"
 )
-target_link_libraries(gmux raylib msgpack-c)
+target_link_libraries(gmux PkgConfig::GTK4 PkgConfig::FONTCONFIG msgpack-c)
 endif()
 
 add_executable(gmux-server gmux_server.c server_image.c)
@@ -101,13 +89,6 @@ target_include_directories(gmux-server PRIVATE
   "${ghostty_SOURCE_DIR}/src/stb"
 )
 target_link_libraries(gmux-server ghostty-vt-static msgpack-c)
-
-# macOS requires these system frameworks for the Raylib client.
-if (APPLE AND GMUX_BUILD_CLIENT)
-  target_link_libraries(gmux "-framework IOKit")
-  target_link_libraries(gmux "-framework Cocoa")
-  target_link_libraries(gmux "-framework OpenGL")
-endif()
 
 # The headless server uses forkpty().
 if (UNIX AND NOT APPLE)

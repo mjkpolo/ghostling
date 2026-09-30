@@ -1,0 +1,22 @@
+name: Build Rocky Linux 9.4 binaries
+
+on:
+  push:
+    branches: [gmux-codex]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: rockylinux/rockylinux:9.4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build client and server
+        run: ./ci/build-rocky.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gmux-rocky-linux-9.4-x86_64
+          path: artifacts/
+          if-no-files-found: error

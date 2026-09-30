@@ -4,11 +4,10 @@ Ghostling is a demo project meant to highlight a minimum
 functional terminal built on the libghostty C API in a
 [single C file](https://github.com/ghostty-org/ghostling/blob/main/main.c).
 
-The example uses Raylib for windowing and rendering. It is single-threaded
-(although libghostty-vt supports threading) and uses a 2D graphics renderer
-instead of a direct GPU renderer like the primary [Ghostty](https://ghostty.org) GUI. This is to
-showcase the flexibility of libghostty and how it can be used in a variety of
-contexts.
+The Linux client uses GTK4/GDK for native Wayland/X11 windowing and Cairo/Pango
+for its initial renderer. The authoritative terminal lives in a separate,
+persistent `gmux-server` process and communicates with the GUI over a Unix
+socket.
 
 > [!WARNING]
 >
@@ -87,16 +86,13 @@ These are the things that libghostty consumers are expected to implement
 on their own, if they want them. This example doesn't implement these
 to try to stay as minimal as possible.
 
-### Limitations Due to Upstreams
+### Current input work
 
 There are some known issues with this demo:
 
-- Kitty keyboard protocol support is broken with some inputs. This is
-  due to limitations of the underlying Raylib input system; it doesn't
-  support rich enough input events to fully and correctly implement the Kitty
-  keyboard protocol. This is a [known issue](https://github.com/glfw/glfw/issues/1502).
-  The libghostty-vt API supports Kitty keyboard protocol correctly, but
-  requires correct input events to do so.
+- GTK now supplies event-driven key press, repeat, release, modifier, and
+  consumed-modifier information. Compose/IME commit handling and the complete
+  physical-key mapping are still being ported from Ghostty's GTK frontend.
 
 ## Building
 
@@ -106,13 +102,13 @@ Requirements:
 - [Ninja](https://ninja-build.org/)
 - A C compiler
 - `curl`, `sha256sum`, and `tar` for `./build.sh` to fetch Zig 0.16.0
-- macOS: [Command Line Tools or Xcode](https://developer.apple.com/xcode/)
-- Linux (Ubuntu/Debian): `sudo apt install -y ninja-build build-essential git libxinerama-dev libxcursor-dev libxrandr-dev libxi-dev libxext-dev libx11-dev libgl-dev`
+- Linux (Ubuntu/Debian): `sudo apt install -y ninja-build build-essential git libgtk-4-dev libfontconfig-dev`
 
 ```sh
 ./build.sh
 ./build/gmux-server "$HOME/.gmux.sock"
 ./build/gmux --connect "$HOME/.gmux.sock"
+```
 ```
 
 For a headless server build on another machine, clone with submodules and run:
@@ -172,7 +168,7 @@ the Ghostty project will maintain official bindings for languages other than C
 and Zig, but I hope the community will create and maintain bindings for many
 languages!
 
-### Does libghostty require Raylib?
+### Does libghostty require GTK?
 
 **No no no!** libghostty has no opinion about the renderer or GUI framework
 used; it's even standalone WASM-compatible for browsers and other environments.
@@ -180,11 +176,12 @@ used; it's even standalone WASM-compatible for browsers and other environments.
 libghostty provides a [high-performance render state API](https://libghostty.tip.ghostty.org/group__render.html)
 which only keeps track of the _state_ required to build a renderer. This is the
 same API used by Ghostty GUI for Metal and OpenGL rendering and in this repository
-for the Raylib 2D graphics API. You can layer any renderer on top of this!
+for the Cairo/Pango renderer in this repository. You can layer any renderer on
+top of this!
 
-### Why CMake, Raylib, etc.?
+### Why CMake and GTK?
 
 I needed to pick _something_. Really, any build system and any library
-could be used. CMake is widely used and supported, and Raylib is a simple
-and elegant library for windowing and 2D rendering that is easy to set up.
-Don't get bogged down in these details!
+could be used. CMake is widely used and supported. GTK gives the Linux client
+native Wayland input, layout-aware key events, IME integration, clipboard
+access, and an event loop close to the one used by Ghostty itself.
