@@ -23,7 +23,7 @@ if [[ ! -x "$zig_dir/zig" ]]; then
 
   zig_archive=$(mktemp "$projects_dir/zig-0.16.0.XXXXXX.tar.xz")
   trap 'rm -f "$zig_archive"' EXIT
-  curl -fL --retry 3 -o "$zig_archive" \
+  curl -fsSL --retry 3 -o "$zig_archive" \
     "https://ziglang.org/download/0.16.0/zig-$zig_platform-0.16.0.tar.xz"
   printf '%s  %s\n' "$zig_sha" "$zig_archive" | sha256sum -c -
   tar -xJf "$zig_archive" -C "$projects_dir"
