@@ -12,12 +12,20 @@ jobs:
     steps:
       - name: Install checkout prerequisites
         run: dnf -y install git tar
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
       - name: Build client and server
-        run: ./ci/build-rocky.sh
+        run: |
+          set -o pipefail
+          ./ci/build-rocky.sh 2>&1 | tee rocky-build.log
+      - name: Report build failure
+        if: failure()
+        run: |
+          message=$(tail -80 rocky-build.log | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
+          echo "::error title=Rocky build log::$message"
       - uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: gmux-rocky-linux-9.4-x86_64
           path: artifacts/
