@@ -2,7 +2,7 @@
 set -euo pipefail
 
 dnf -y install \
-  cmake curl file fontconfig-devel gcc gcc-c++ git gtk4-devel make ninja-build \
+  cmake curl file fontconfig-devel gcc gcc-c++ git gtk4-devel make \
   tar xz
 
 ./build.sh
