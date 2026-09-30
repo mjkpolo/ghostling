@@ -3208,8 +3208,12 @@ static int run_client(int socket_fd)
         "Monaspace Argon Frozen 24");
     client.italic = pango_font_description_copy(client.regular);
     pango_font_description_set_style(client.italic, PANGO_STYLE_ITALIC);
-    client.application = gtk_application_new("org.ghostty.gmux",
-                                              G_APPLICATION_DEFAULT_FLAGS);
+#if GLIB_CHECK_VERSION(2, 74, 0)
+    GApplicationFlags flags = G_APPLICATION_DEFAULT_FLAGS;
+#else
+    GApplicationFlags flags = G_APPLICATION_FLAGS_NONE;
+#endif
+    client.application = gtk_application_new("org.ghostty.gmux", flags);
     g_signal_connect(client.application, "activate",
                      G_CALLBACK(gtk_activate), &client);
     int result = g_application_run(G_APPLICATION(client.application), 0, NULL);
