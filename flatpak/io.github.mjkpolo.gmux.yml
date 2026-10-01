@@ -1,0 +1,49 @@
+app-id: io.github.mjkpolo.gmux
+runtime: org.gnome.Platform
+runtime-version: "50"
+sdk: org.gnome.Sdk
+command: gmux
+
+cleanup:
+  - /include
+  - /lib/cmake
+  - /lib/pkgconfig
+  - "*.a"
+  - "*.la"
+
+finish-args:
+  - --device=dri
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  # The host server should bind beneath $XDG_RUNTIME_DIR/gmux. This exposes
+  # only that socket directory instead of granting the client home access.
+  - --filesystem=xdg-run/gmux:create
+
+modules:
+  - name: gmux
+    buildsystem: simple
+    build-commands:
+      - >-
+        cmake -S . -B build-flatpak -G Ninja
+        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_INSTALL_PREFIX=/app
+        -DGMUX_BUILD_CLIENT=ON
+        -DGMUX_BUILD_SERVER=OFF
+        -DGMUX_GHOSTTY_SOURCE_DIR=/run/build/gmux/vendor/ghostty
+      - cmake --build build-flatpak
+      - cmake --install build-flatpak
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - .flatpak-builder
+          - .git
+          - artifacts
+          - build
+          - build-client
+          - flatpak/repo
+      - type: git
+        url: https://github.com/ghostty-org/ghostty.git
+        commit: f64f4aca2c29b554d111b36c3d946a9bddd159ff
+        dest: vendor/ghostty

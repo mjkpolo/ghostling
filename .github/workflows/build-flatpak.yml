@@ -1,0 +1,22 @@
+name: Build GTK Flatpak
+
+on:
+  push:
+    branches: [gmux-codex]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: gmux.flatpak
+          manifest-path: flatpak/io.github.mjkpolo.gmux.yml
+          cache-key: flatpak-builder-${{ github.sha }}

@@ -6,13 +6,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(FetchContent)
 option(GMUX_BUILD_CLIENT "Build the GTK client" ON)
-
-# Ghostty's CMake wrapper caches ZIG_EXECUTABLE. When the flake changes the Zig
-# package, an existing build tree can otherwise keep using the old store path.
-# Resolve Zig from the active environment before adding Ghostty so builds follow
-# the flake/dev-shell selection.
-find_program(GHOSTLING_ZIG_EXECUTABLE zig REQUIRED NO_CACHE)
-set(ZIG_EXECUTABLE "${GHOSTLING_ZIG_EXECUTABLE}" CACHE FILEPATH "Path to the Zig compiler" FORCE)
+option(GMUX_BUILD_SERVER "Build the headless libghostty server" ON)
+set(GMUX_GHOSTTY_SOURCE_DIR "" CACHE PATH
+    "Existing Ghostty source tree for a client-only build")
 
 # --- GTK client --------------------------------------------------------------
 if (GMUX_BUILD_CLIENT)
@@ -26,11 +22,24 @@ endif()
 # The Ghostty CMakeLists.txt delegates to `zig build lib-vt` to produce the
 # shared library. See https://ghostty.org/docs/install/build for the
 # required Zig version.
-FetchContent_Declare(ghostty
-  GIT_REPOSITORY https://github.com/ghostty-org/ghostty.git
-  GIT_TAG f64f4aca2c29b554d111b36c3d946a9bddd159ff
-)
-FetchContent_MakeAvailable(ghostty)
+if (GMUX_BUILD_SERVER)
+  # Ghostty's CMake wrapper caches ZIG_EXECUTABLE. Resolve Zig from the active
+  # environment so builds follow build.sh's pinned toolchain.
+  find_program(GHOSTLING_ZIG_EXECUTABLE zig REQUIRED NO_CACHE)
+  set(ZIG_EXECUTABLE "${GHOSTLING_ZIG_EXECUTABLE}"
+      CACHE FILEPATH "Path to the Zig compiler" FORCE)
+  FetchContent_Declare(ghostty
+    GIT_REPOSITORY https://github.com/ghostty-org/ghostty.git
+    GIT_TAG f64f4aca2c29b554d111b36c3d946a9bddd159ff
+  )
+  FetchContent_MakeAvailable(ghostty)
+elseif (GMUX_BUILD_CLIENT)
+  if (NOT GMUX_GHOSTTY_SOURCE_DIR)
+    message(FATAL_ERROR
+      "A client-only build requires -DGMUX_GHOSTTY_SOURCE_DIR=/path/to/ghostty")
+  endif()
+  set(ghostty_SOURCE_DIR "${GMUX_GHOSTTY_SOURCE_DIR}")
+endif()
 
 # --- MessagePack -------------------------------------------------------------
 # Vendored as a Git submodule so the exact C implementation is visible and
@@ -82,15 +91,24 @@ target_include_directories(gmux PRIVATE
 target_link_libraries(gmux PkgConfig::GTK4 PkgConfig::FONTCONFIG msgpack-c)
 endif()
 
-add_executable(gmux-server gmux_server.c server_image.c)
-target_compile_features(gmux-server PRIVATE c_std_11)
-target_compile_definitions(gmux-server PRIVATE GMUX_SERVER)
-target_include_directories(gmux-server PRIVATE
-  "${ghostty_SOURCE_DIR}/src/stb"
-)
-target_link_libraries(gmux-server ghostty-vt-static msgpack-c)
+if (GMUX_BUILD_SERVER)
+  add_executable(gmux-server gmux_server.c server_image.c)
+  target_compile_features(gmux-server PRIVATE c_std_11)
+  target_compile_definitions(gmux-server PRIVATE GMUX_SERVER)
+  target_include_directories(gmux-server PRIVATE
+    "${ghostty_SOURCE_DIR}/src/stb"
+  )
+  target_link_libraries(gmux-server ghostty-vt-static msgpack-c)
+endif()
 
 # The headless server uses forkpty().
-if (UNIX AND NOT APPLE)
+if (GMUX_BUILD_SERVER AND UNIX AND NOT APPLE)
   target_link_libraries(gmux-server util m)
+endif()
+
+if (GMUX_BUILD_CLIENT)
+  install(TARGETS gmux RUNTIME DESTINATION bin)
+endif()
+if (GMUX_BUILD_SERVER)
+  install(TARGETS gmux-server RUNTIME DESTINATION bin)
 endif()

@@ -3213,7 +3213,7 @@ static int run_client(int socket_fd)
 #else
     GApplicationFlags flags = G_APPLICATION_FLAGS_NONE;
 #endif
-    client.application = gtk_application_new("org.ghostty.gmux", flags);
+    client.application = gtk_application_new("io.github.mjkpolo.gmux", flags);
     g_signal_connect(client.application, "activate",
                      G_CALLBACK(gtk_activate), &client);
     int result = g_application_run(G_APPLICATION(client.application), 0, NULL);

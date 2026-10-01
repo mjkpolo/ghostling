@@ -41,10 +41,10 @@ export ZIG_LOCAL_CACHE_DIR="$project_dir/build/.zig-cache"
 
 if [[ "${1:-}" == --server-only ]]; then
   cmake -S "$project_dir" -B "$project_dir/build" \
-    -DCMAKE_BUILD_TYPE=Release -DGMUX_BUILD_CLIENT=OFF
+    -DCMAKE_BUILD_TYPE=Release -DGMUX_BUILD_CLIENT=OFF -DGMUX_BUILD_SERVER=ON
   cmake --build "$project_dir/build" --target gmux-server
 else
   cmake -S "$project_dir" -B "$project_dir/build" \
-    -DCMAKE_BUILD_TYPE=Release -DGMUX_BUILD_CLIENT=ON
+    -DCMAKE_BUILD_TYPE=Release -DGMUX_BUILD_CLIENT=ON -DGMUX_BUILD_SERVER=ON
   cmake --build "$project_dir/build"
 fi
