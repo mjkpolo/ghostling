@@ -191,6 +191,7 @@ typedef enum {
     INPUT_MOUSE,
     INPUT_FOCUS,
     INPUT_SHUTDOWN,
+    INPUT_PASTE,
 } InputKind;
 
 typedef struct { uint32_t kind, size; } InputRecord;
@@ -557,6 +558,11 @@ static bool input_pack(const InputWire *wire, msgpack_sbuffer *buffer)
             msgpack_pack_uint32(&packer, record.kind);
             value.focused ? msgpack_pack_true(&packer)
                           : msgpack_pack_false(&packer);
+        } else if (record.kind == INPUT_PASTE) {
+            msgpack_pack_array(&packer, 2);
+            msgpack_pack_uint32(&packer, record.kind);
+            msgpack_pack_bin(&packer, record.size);
+            msgpack_pack_bin_body(&packer, payload, record.size);
         } else {
             return false;
         }
@@ -644,6 +650,10 @@ static bool input_unpack(const void *data, size_t len, InputWire *wire)
             if (!object_bool(field[1], &focus.focused)
                 || !input_append(wire, INPUT_FOCUS, &focus, sizeof(focus)))
                 goto fail;
+        } else if (kind == INPUT_PASTE && message.via.array.size == 2
+                   && field[1].type == MSGPACK_OBJECT_BIN) {
+            if (!input_append(wire, INPUT_PASTE, field[1].via.bin.ptr,
+                              field[1].via.bin.size)) goto fail;
         } else {
             goto fail;
         }
@@ -903,6 +913,28 @@ static bool apply_input_wire(InputWire *wire, int pty_fd,
                                      buf, sizeof(buf), &written);
                 pty_write(pty_fd, buf, written);
             }
+        } else if (record.kind == INPUT_PASTE) {
+            bool bracketed = false;
+            GhosttyTerminalModeConfig mode = {
+                .mode = GHOSTTY_MODE_BRACKETED_PASTE,
+            };
+            if (ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MODE,
+                                     &mode) == GHOSTTY_SUCCESS)
+                bracketed = mode.value;
+            char *data = malloc(record.size ? record.size : 1);
+            if (data) {
+                memcpy(data, payload, record.size);
+                size_t encoded_len = 0;
+                GhosttyResult paste_result = ghostty_paste_encode(
+                    data, record.size, bracketed, NULL, 0, &encoded_len);
+                char *encoded = malloc(encoded_len ? encoded_len : 1);
+                if (encoded && paste_result == GHOSTTY_OUT_OF_SPACE
+                    && ghostty_paste_encode(data, record.size, bracketed,
+                        encoded, encoded_len, &encoded_len) == GHOSTTY_SUCCESS)
+                    pty_write(pty_fd, encoded, encoded_len);
+                free(encoded);
+                free(data);
+            }
         }
         offset += record.size;
     }
@@ -922,6 +954,7 @@ typedef enum {
     SNAPSHOT_ROW = 2,
     SNAPSHOT_IMAGE = 3,
     SNAPSHOT_TITLE = 4,
+    SNAPSHOT_CLIPBOARD = 5,
 } SnapshotRecordKind;
 typedef struct { uint32_t kind, size; } SnapshotRecord;
 typedef struct { uint8_t r, g, b; } SnapshotRgb;
@@ -970,6 +1003,10 @@ typedef struct {
     uint32_t pixel_len;
     int32_t layer;
 } SnapshotImage;
+typedef struct {
+    uint32_t location;
+    uint32_t data_len;
+} SnapshotClipboard;
 
 static bool snapshot_append(RenderSnapshotWire *wire,
                             const void *data, size_t len);
@@ -1123,6 +1160,18 @@ static bool snapshot_pack(const RenderSnapshotWire *wire,
             msgpack_pack_uint32(&packer, record.kind);
             msgpack_pack_str(&packer, record.size);
             msgpack_pack_str_body(&packer, payload, record.size);
+        } else if (record.kind == SNAPSHOT_CLIPBOARD
+                   && record.size >= sizeof(SnapshotClipboard)) {
+            SnapshotClipboard clipboard;
+            memcpy(&clipboard, payload, sizeof(clipboard));
+            if (sizeof(clipboard) + clipboard.data_len != record.size)
+                return false;
+            msgpack_pack_array(&packer, 3);
+            msgpack_pack_uint32(&packer, record.kind);
+            msgpack_pack_uint32(&packer, clipboard.location);
+            msgpack_pack_bin(&packer, clipboard.data_len);
+            msgpack_pack_bin_body(&packer, payload + sizeof(clipboard),
+                                  clipboard.data_len);
         } else {
             return false;
         }
@@ -1290,6 +1339,25 @@ static bool snapshot_unpack(const void *data, size_t len,
                    && field[1].type == MSGPACK_OBJECT_STR) {
             if (!snapshot_record(wire, SNAPSHOT_TITLE,
                     field[1].via.str.ptr, field[1].via.str.size)) goto fail;
+        } else if (kind == SNAPSHOT_CLIPBOARD
+                   && message.via.array.size == 3
+                   && field[2].type == MSGPACK_OBJECT_BIN) {
+            uint64_t location;
+            if (!object_u64(field[1], &location)
+                || location > UINT32_MAX
+                || field[2].via.bin.size > UINT32_MAX) goto fail;
+            SnapshotClipboard clipboard = {
+                .location = (uint32_t)location,
+                .data_len = field[2].via.bin.size,
+            };
+            SnapshotRecord record = {
+                SNAPSHOT_CLIPBOARD,
+                (uint32_t)(sizeof(clipboard) + clipboard.data_len),
+            };
+            if (!snapshot_append(wire, &record, sizeof(record))
+                || !snapshot_append(wire, &clipboard, sizeof(clipboard))
+                || !snapshot_append(wire, field[2].via.bin.ptr,
+                                    clipboard.data_len)) goto fail;
         } else {
             goto fail;
         }
@@ -2127,6 +2195,10 @@ typedef struct {
     uint16_t rows;
     bool title_changed;
     char title[256];
+    bool clipboard_changed;
+    GhosttyClipboardLocation clipboard_location;
+    uint8_t *clipboard_data;
+    size_t clipboard_len;
 } EffectsContext;
 
 // write_pty effect — the terminal calls this whenever a VT sequence
@@ -2205,6 +2277,37 @@ static void effect_title_changed(GhosttyTerminal terminal, void *userdata)
     ctx->title_changed = true;
 }
 
+static GhosttyClipboardWriteResult effect_clipboard_write(
+    GhosttyTerminal terminal, void *userdata,
+    const GhosttyClipboardWrite *write)
+{
+    (void)terminal;
+    EffectsContext *ctx = userdata;
+    const GhosttyString *text = NULL;
+    for (size_t i = 0; i < write->contents_len; i++) {
+        GhosttyString mime = write->contents[i].mime;
+        if (mime.len >= 10
+            && memcmp(mime.ptr, "text/plain", 10) == 0) {
+            text = &write->contents[i].data;
+            break;
+        }
+    }
+    if (write->contents_len && !text)
+        return GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED;
+
+    size_t len = text ? text->len : 0;
+    uint8_t *copy = malloc(len + 1);
+    if (!copy) return GHOSTTY_CLIPBOARD_WRITE_RESULT_BUSY;
+    if (len) memcpy(copy, text->ptr, len);
+    copy[len] = '\0';
+    free(ctx->clipboard_data);
+    ctx->clipboard_data = copy;
+    ctx->clipboard_len = len;
+    ctx->clipboard_location = write->location;
+    ctx->clipboard_changed = true;
+    return GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS;
+}
+
 // color_scheme effect — responds to CSI ? 996 n. The server does not
 // know the client OS color scheme, so ignore the query rather than guessing.
 static bool effect_color_scheme(GhosttyTerminal terminal, void *userdata,
@@ -2240,6 +2343,7 @@ static int run_server(int listener_fd)
     GhosttyKittyGraphicsPlacementIterator placement_iter = NULL;
     InputWire input = {0};
     RenderSnapshotWire snapshot = {0};
+    EffectsContext effects = {0};
     InputResize size = {
         initial_cols, initial_rows,
         initial_cell_width, initial_cell_height,
@@ -2266,7 +2370,7 @@ static int run_server(int listener_fd)
                        initial_cell_width, initial_cell_height);
     if (pty_fd < 0) goto cleanup;
 
-    EffectsContext effects = {
+    effects = (EffectsContext){
         .pty_fd = pty_fd,
         .cell_width = initial_cell_width,
         .cell_height = initial_cell_height,
@@ -2284,6 +2388,8 @@ static int run_server(int listener_fd)
                          (const void *)effect_xtversion);
     ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_TITLE_CHANGED,
                          (const void *)effect_title_changed);
+    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE,
+                         (const void *)effect_clipboard_write);
     ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_COLOR_SCHEME,
                          (const void *)effect_color_scheme);
 
@@ -2385,7 +2491,7 @@ static int run_server(int listener_fd)
                 GHOSTTY_RENDER_STATE_DATA_DIRTY, &dirty);
             if (!sent_snapshot) dirty = GHOSTTY_RENDER_STATE_DIRTY_FULL;
             if (dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE
-                || effects.title_changed) {
+                || effects.title_changed || effects.clipboard_changed) {
                 GhosttyTerminalScrollbar scrollbar = {0};
                 bool has_scrollbar = ghostty_terminal_get(terminal,
                     GHOSTTY_TERMINAL_DATA_SCROLLBAR, &scrollbar)
@@ -2398,6 +2504,23 @@ static int run_server(int listener_fd)
                 if (effects.title_changed)
                     snapshot_record(&snapshot, SNAPSHOT_TITLE,
                                     effects.title, strlen(effects.title));
+                if (effects.clipboard_changed
+                    && effects.clipboard_len <= UINT32_MAX) {
+                    SnapshotClipboard clipboard = {
+                        .location = effects.clipboard_location,
+                        .data_len = (uint32_t)effects.clipboard_len,
+                    };
+                    SnapshotRecord record = {
+                        SNAPSHOT_CLIPBOARD,
+                        (uint32_t)(sizeof(clipboard)
+                            + effects.clipboard_len),
+                    };
+                    snapshot_append(&snapshot, &record, sizeof(record));
+                    snapshot_append(&snapshot, &clipboard,
+                                    sizeof(clipboard));
+                    snapshot_append(&snapshot, effects.clipboard_data,
+                                    effects.clipboard_len);
+                }
                 if (!snapshot_queue(&connection, &snapshot)
                     || !wire_flush(&connection)) {
                     wire_connection_close(&connection);
@@ -2406,6 +2529,7 @@ static int run_server(int listener_fd)
                     continue;
                 }
                 effects.title_changed = false;
+                effects.clipboard_changed = false;
                 sent_snapshot = true;
             }
         }
@@ -2413,6 +2537,7 @@ static int run_server(int listener_fd)
     result = 0;
 
 cleanup:
+    free(effects.clipboard_data);
     free(input.data);
     free(snapshot.data);
     wire_connection_close(&connection);
@@ -2559,6 +2684,8 @@ typedef struct {
     double mouse_x, mouse_y;
     guint mouse_buttons;
     ClientSelection selection;
+    char *pending_clipboard;
+    GhosttyClipboardLocation pending_clipboard_location;
     bool keys[256];
     guint socket_source;
 } GtkClient;
@@ -2729,6 +2856,98 @@ static void gtk_copy_selection(GtkClient *client)
     g_string_free(text, TRUE);
 }
 
+static void gtk_clear_selection(GtkClient *client)
+{
+    if (!client->selection.active && !client->selection.dragging) return;
+    client->selection = (ClientSelection){0};
+    gtk_widget_queue_draw(client->area);
+}
+
+static void gtk_set_pending_clipboard(GtkClient *client)
+{
+    if (!client->pending_clipboard) return;
+    GdkClipboard *clipboard =
+        client->pending_clipboard_location
+            == GHOSTTY_CLIPBOARD_LOCATION_STANDARD
+        ? gtk_widget_get_clipboard(client->area)
+        : gtk_widget_get_primary_clipboard(client->area);
+    gdk_clipboard_set_text(clipboard, client->pending_clipboard);
+}
+
+static bool snapshot_updates_selection(const RenderSnapshotWire *wire,
+                                       const ClientSelection *selection)
+{
+    if (!selection->active) return false;
+    uint16_t start_row, start_col, end_row, end_col;
+    selection_bounds(selection, &start_row, &start_col, &end_row, &end_col);
+    (void)start_col;
+    (void)end_col;
+    size_t offset = 0;
+    while (offset + sizeof(SnapshotRecord) <= wire->len) {
+        SnapshotRecord record;
+        memcpy(&record, wire->data + offset, sizeof(record));
+        offset += sizeof(record);
+        if (offset + record.size > wire->len) return true;
+        if (record.kind == SNAPSHOT_ROW
+            && record.size >= sizeof(SnapshotRow)) {
+            SnapshotRow row;
+            memcpy(&row, wire->data + offset, sizeof(row));
+            if (row.row >= start_row && row.row <= end_row) return true;
+        }
+        offset += record.size;
+    }
+    return false;
+}
+
+static void apply_snapshot_clipboard(GtkClient *client,
+                                     const RenderSnapshotWire *wire)
+{
+    size_t offset = 0;
+    while (offset + sizeof(SnapshotRecord) <= wire->len) {
+        SnapshotRecord record;
+        memcpy(&record, wire->data + offset, sizeof(record));
+        offset += sizeof(record);
+        if (offset + record.size > wire->len) return;
+        if (record.kind == SNAPSHOT_CLIPBOARD
+            && record.size >= sizeof(SnapshotClipboard)) {
+            SnapshotClipboard clipboard;
+            memcpy(&clipboard, wire->data + offset, sizeof(clipboard));
+            const char *data = (const char *)(wire->data + offset
+                                              + sizeof(clipboard));
+            if (sizeof(clipboard) + clipboard.data_len == record.size
+                && g_utf8_validate(data, clipboard.data_len, NULL)) {
+                g_free(client->pending_clipboard);
+                client->pending_clipboard =
+                    g_strndup(data, clipboard.data_len);
+                client->pending_clipboard_location = clipboard.location;
+                gtk_set_pending_clipboard(client);
+            }
+        }
+        offset += record.size;
+    }
+}
+
+static void gtk_paste_ready(GObject *source, GAsyncResult *result,
+                            gpointer userdata)
+{
+    GtkClient *client = userdata;
+    gtk_set_pending_clipboard(client);
+    GError *error = NULL;
+    char *text = gdk_clipboard_read_text_finish(
+        GDK_CLIPBOARD(source), result, &error);
+    if (text) {
+        gtk_client_send(client, INPUT_PASTE, text, strlen(text));
+        g_free(text);
+    }
+    if (error) g_error_free(error);
+}
+
+static void gtk_paste(GtkClient *client)
+{
+    gdk_clipboard_read_text_async(gtk_widget_get_clipboard(client->area),
+                                  NULL, gtk_paste_ready, client);
+}
+
 static gboolean gtk_key_pressed(GtkEventControllerKey *controller,
                                 guint keyval, guint keycode,
                                 GdkModifierType state, gpointer userdata)
@@ -2738,6 +2957,7 @@ static gboolean gtk_key_pressed(GtkEventControllerKey *controller,
             == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)
         && (keyval == GDK_KEY_plus || keyval == GDK_KEY_equal
             || keyval == GDK_KEY_KP_Add)) {
+        gtk_clear_selection(client);
         if (client->font_size < 96) client->font_size++;
         gtk_apply_font(client);
         return TRUE;
@@ -2746,6 +2966,7 @@ static gboolean gtk_key_pressed(GtkEventControllerKey *controller,
             == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)
         && (keyval == GDK_KEY_minus || keyval == GDK_KEY_underscore
             || keyval == GDK_KEY_KP_Subtract)) {
+        gtk_clear_selection(client);
         if (client->font_size > 6) client->font_size--;
         gtk_apply_font(client);
         return TRUE;
@@ -2754,8 +2975,17 @@ static gboolean gtk_key_pressed(GtkEventControllerKey *controller,
             == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)
         && (keyval == GDK_KEY_c || keyval == GDK_KEY_C)) {
         gtk_copy_selection(client);
+        gtk_clear_selection(client);
         return TRUE;
     }
+    if ((state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
+            == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)
+        && (keyval == GDK_KEY_v || keyval == GDK_KEY_V)) {
+        gtk_clear_selection(client);
+        gtk_paste(client);
+        return TRUE;
+    }
+    gtk_clear_selection(client);
     InputKey message = {
         .key = gdk_key_to_ghostty(keyval),
         .action = keycode < 256 && client->keys[keycode]
@@ -2787,6 +3017,7 @@ static void gtk_key_released(GtkEventControllerKey *controller,
     if ((state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
             == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)
         && (keyval == GDK_KEY_c || keyval == GDK_KEY_C
+            || keyval == GDK_KEY_v || keyval == GDK_KEY_V
             || keyval == GDK_KEY_plus || keyval == GDK_KEY_equal
             || keyval == GDK_KEY_KP_Add || keyval == GDK_KEY_minus
             || keyval == GDK_KEY_underscore
@@ -2819,7 +3050,6 @@ static void gtk_mouse_click(GtkGestureClick *gesture, int presses,
         gtk_selection_position(client, x, y, &row, &col);
         if (action == GHOSTTY_MOUSE_ACTION_PRESS) {
             client->selection = (ClientSelection){
-                .active = true,
                 .dragging = true,
                 .start_row = row,
                 .start_col = col,
@@ -2830,6 +3060,9 @@ static void gtk_mouse_click(GtkGestureClick *gesture, int presses,
             client->selection.end_row = row;
             client->selection.end_col = col;
             client->selection.dragging = false;
+            if (client->selection.start_row == row
+                && client->selection.start_col == col)
+                client->selection.active = false;
         }
         gtk_widget_queue_draw(client->area);
         return;
@@ -2855,6 +3088,7 @@ static void gtk_mouse_click(GtkGestureClick *gesture, int presses,
 static void gtk_mouse_pressed(GtkGestureClick *gesture, int presses,
                               double x, double y, gpointer userdata)
 {
+    gtk_set_pending_clipboard(userdata);
     gtk_mouse_click(gesture, presses, x, y, userdata,
                     GHOSTTY_MOUSE_ACTION_PRESS);
 }
@@ -2877,6 +3111,9 @@ static void gtk_mouse_motion(GtkEventControllerMotion *controller,
             gtk_selection_position(client, x, y,
                                    &client->selection.end_row,
                                    &client->selection.end_col);
+            client->selection.active =
+                client->selection.start_row != client->selection.end_row
+                || client->selection.start_col != client->selection.end_col;
             gtk_widget_queue_draw(client->area);
         }
         return;
@@ -2973,8 +3210,12 @@ static gboolean gtk_socket_ready(gint fd, GIOCondition condition,
             || !snapshot_decode(packed, packed_len, &client->snapshot)) {
             connected = false;
         } else {
+            if (snapshot_updates_selection(&client->snapshot,
+                                           &client->selection))
+                gtk_clear_selection(client);
             render_client_apply(&client->render, &client->snapshot);
             apply_snapshot_title(client->window, &client->snapshot);
+            apply_snapshot_clipboard(client, &client->snapshot);
             gtk_widget_queue_draw(client->area);
         }
         free(packed);
@@ -3075,6 +3316,7 @@ static int run_client(int socket_fd)
     render_client_free(&client.render);
     free(client.input.data);
     free(client.snapshot.data);
+    g_free(client.pending_clipboard);
     wire_connection_close(&client.connection);
     pango_font_description_free(client.italic);
     pango_font_description_free(client.regular);
