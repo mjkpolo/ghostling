@@ -928,6 +928,7 @@ typedef struct { uint8_t r, g, b; } SnapshotRgb;
 typedef struct {
     uint16_t rows, cols;
     SnapshotRgb background;
+    bool mouse_tracking;
     bool cursor_visible;
     uint16_t cursor_col, cursor_row;
     SnapshotRgb cursor_color;
@@ -937,6 +938,7 @@ typedef struct {
 typedef struct {
     uint16_t row;
     uint16_t cell_count;
+    bool wrapped;
 } SnapshotRow;
 typedef struct {
     uint16_t col;
@@ -946,11 +948,13 @@ typedef struct {
     bool bold, italic, faint, blink, inverse, invisible;
     bool strikethrough, overline;
     uint8_t underline;
+    uint8_t wide;
     char text[64];
 } SnapshotCell;
 typedef struct {
     SnapshotCell *cells;
     uint16_t cell_count;
+    bool wrapped;
 } CachedRow;
 typedef struct {
     SnapshotHeader header;
@@ -1024,11 +1028,13 @@ static bool snapshot_pack(const RenderSnapshotWire *wire,
             && record.size == sizeof(SnapshotHeader)) {
             SnapshotHeader header;
             memcpy(&header, payload, sizeof(header));
-            msgpack_pack_array(&packer, 12);
+            msgpack_pack_array(&packer, 13);
             msgpack_pack_uint32(&packer, record.kind);
             msgpack_pack_uint16(&packer, header.rows);
             msgpack_pack_uint16(&packer, header.cols);
             pack_rgb(&packer, header.background);
+            header.mouse_tracking ? msgpack_pack_true(&packer)
+                                  : msgpack_pack_false(&packer);
             header.cursor_visible ? msgpack_pack_true(&packer)
                                   : msgpack_pack_false(&packer);
             msgpack_pack_uint16(&packer, header.cursor_col);
@@ -1046,16 +1052,18 @@ static bool snapshot_pack(const RenderSnapshotWire *wire,
             size_t expected = sizeof(row)
                 + (size_t)row.cell_count * sizeof(SnapshotCell);
             if (expected != record.size) return false;
-            msgpack_pack_array(&packer, 3);
+            msgpack_pack_array(&packer, 4);
             msgpack_pack_uint32(&packer, record.kind);
             msgpack_pack_uint16(&packer, row.row);
+            row.wrapped ? msgpack_pack_true(&packer)
+                        : msgpack_pack_false(&packer);
             msgpack_pack_array(&packer, row.cell_count);
             const SnapshotCell *cells =
                 (const SnapshotCell *)(payload + sizeof(row));
             for (uint16_t i = 0; i < row.cell_count; i++) {
                 const SnapshotCell *cell = &cells[i];
                 size_t text_len = strnlen(cell->text, sizeof(cell->text));
-                msgpack_pack_array(&packer, 17);
+                msgpack_pack_array(&packer, 18);
                 msgpack_pack_uint16(&packer, cell->col);
                 pack_rgb(&packer, cell->foreground);
                 pack_rgb(&packer, cell->background);
@@ -1083,6 +1091,7 @@ static bool snapshot_pack(const RenderSnapshotWire *wire,
                 cell->overline ? msgpack_pack_true(&packer)
                                : msgpack_pack_false(&packer);
                 msgpack_pack_uint8(&packer, cell->underline);
+                msgpack_pack_uint8(&packer, cell->wide);
                 msgpack_pack_str(&packer, text_len);
                 msgpack_pack_str_body(&packer, cell->text, text_len);
             }
@@ -1142,35 +1151,45 @@ static bool snapshot_unpack(const void *data, size_t len,
         msgpack_object *field = message.via.array.ptr;
         uint64_t kind;
         if (!object_u64(field[0], &kind)) goto fail;
-        if (kind == SNAPSHOT_HEADER && message.via.array.size == 12) {
+        if (kind == SNAPSHOT_HEADER
+            && (message.via.array.size == 12
+                || message.via.array.size == 13)) {
             uint64_t rows, cols, cursor_col, cursor_row;
             SnapshotHeader header = {0};
+            uint32_t base = message.via.array.size == 13 ? 1 : 0;
             if (!object_u64(field[1], &rows)
                 || !object_u64(field[2], &cols)
                 || !unpack_rgb(field[3], &header.background)
-                || !object_bool(field[4], &header.cursor_visible)
-                || !object_u64(field[5], &cursor_col)
-                || !object_u64(field[6], &cursor_row)
-                || !unpack_rgb(field[7], &header.cursor_color)
-                || !object_bool(field[8], &header.scrollbar_visible)
-                || !object_u64(field[9], &header.scrollbar_total)
-                || !object_u64(field[10], &header.scrollbar_len)
-                || !object_u64(field[11], &header.scrollbar_offset)) goto fail;
+                || (base && !object_bool(field[4], &header.mouse_tracking))
+                || !object_bool(field[4 + base], &header.cursor_visible)
+                || !object_u64(field[5 + base], &cursor_col)
+                || !object_u64(field[6 + base], &cursor_row)
+                || !unpack_rgb(field[7 + base], &header.cursor_color)
+                || !object_bool(field[8 + base], &header.scrollbar_visible)
+                || !object_u64(field[9 + base], &header.scrollbar_total)
+                || !object_u64(field[10 + base], &header.scrollbar_len)
+                || !object_u64(field[11 + base], &header.scrollbar_offset))
+                goto fail;
             header.rows = (uint16_t)rows;
             header.cols = (uint16_t)cols;
             header.cursor_col = (uint16_t)cursor_col;
             header.cursor_row = (uint16_t)cursor_row;
             if (!snapshot_record(wire, SNAPSHOT_HEADER,
                                  &header, sizeof(header))) goto fail;
-        } else if (kind == SNAPSHOT_ROW && message.via.array.size == 3
-                   && field[2].type == MSGPACK_OBJECT_ARRAY) {
+        } else if (kind == SNAPSHOT_ROW
+                   && (message.via.array.size == 3
+                       || message.via.array.size == 4)) {
+            uint32_t cells_index = message.via.array.size == 4 ? 3 : 2;
             uint64_t row_index;
             if (!object_u64(field[1], &row_index)
-                || field[2].via.array.size > UINT16_MAX) goto fail;
+                || field[cells_index].type != MSGPACK_OBJECT_ARRAY
+                || field[cells_index].via.array.size > UINT16_MAX) goto fail;
             SnapshotRow row = {
                 .row = (uint16_t)row_index,
-                .cell_count = (uint16_t)field[2].via.array.size,
+                .cell_count = (uint16_t)field[cells_index].via.array.size,
             };
+            if (cells_index == 3 && !object_bool(field[2], &row.wrapped))
+                goto fail;
             SnapshotRecord record = {
                 SNAPSHOT_ROW,
                 (uint32_t)(sizeof(row)
@@ -1179,10 +1198,11 @@ static bool snapshot_unpack(const void *data, size_t len,
             if (!snapshot_append(wire, &record, sizeof(record))
                 || !snapshot_append(wire, &row, sizeof(row))) goto fail;
             for (uint16_t j = 0; j < row.cell_count; j++) {
-                msgpack_object cell_object = field[2].via.array.ptr[j];
+                msgpack_object cell_object = field[cells_index].via.array.ptr[j];
                 if (cell_object.type != MSGPACK_OBJECT_ARRAY
                     || (cell_object.via.array.size != 8
-                        && cell_object.via.array.size != 17)) goto fail;
+                        && cell_object.via.array.size != 17
+                        && cell_object.via.array.size != 18)) goto fail;
                 msgpack_object *cell_field = cell_object.via.array.ptr;
                 uint64_t col;
                 SnapshotCell cell = {0};
@@ -1216,6 +1236,13 @@ static bool snapshot_unpack(const void *data, size_t len,
                         || underline > UINT8_MAX) goto fail;
                     cell.underline = (uint8_t)underline;
                     text_index = 16;
+                    if (cell_object.via.array.size == 18) {
+                        uint64_t wide;
+                        if (!object_u64(cell_field[16], &wide)
+                            || wide > UINT8_MAX) goto fail;
+                        cell.wide = (uint8_t)wide;
+                        text_index = 17;
+                    }
                 }
                 if (cell_field[text_index].type != MSGPACK_OBJECT_STR
                     || cell_field[text_index].via.str.size
@@ -1470,6 +1497,8 @@ static void serialize_render_snapshot(
         GHOSTTY_RENDER_STATE_DATA_ROWS, &header.rows);
     ghostty_render_state_get(render_state,
         GHOSTTY_RENDER_STATE_DATA_COLS, &header.cols);
+    ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING,
+                         &header.mouse_tracking);
 
     bool cursor_in_viewport = false;
     ghostty_render_state_get(render_state,
@@ -1526,6 +1555,10 @@ static void serialize_render_snapshot(
         const size_t record_offset = wire->len;
         SnapshotRecord record = { SNAPSHOT_ROW, sizeof(SnapshotRow) };
         SnapshotRow row = { .row = row_index };
+        GhosttyRow raw_row = 0;
+        if (ghostty_render_state_row_get(row_iter,
+                GHOSTTY_RENDER_STATE_ROW_DATA_RAW, &raw_row) == GHOSTTY_SUCCESS)
+            ghostty_row_get(raw_row, GHOSTTY_ROW_DATA_WRAP, &row.wrapped);
         snapshot_append(wire, &record, sizeof(record));
         const size_t row_offset = wire->len;
         snapshot_append(wire, &row, sizeof(row));
@@ -1537,6 +1570,13 @@ static void serialize_render_snapshot(
                 .foreground = snapshot_rgb(colors.foreground),
                 .background = snapshot_rgb(colors.background),
             };
+            GhosttyCell raw_cell = 0;
+            GhosttyCellWide wide = GHOSTTY_CELL_WIDE_NARROW;
+            if (ghostty_render_state_row_cells_get(cells,
+                    GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW,
+                    &raw_cell) == GHOSTTY_SUCCESS)
+                ghostty_cell_get(raw_cell, GHOSTTY_CELL_DATA_WIDE, &wide);
+            cell.wide = (uint8_t)wide;
             uint32_t grapheme_len = 0;
             ghostty_render_state_row_cells_get(cells,
                 GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN,
@@ -1668,6 +1708,7 @@ static void render_client_apply(RenderClientState *client,
                 if (row.cell_count == 0 || cells) {
                     cached->cells = cells;
                     cached->cell_count = row.cell_count;
+                    cached->wrapped = row.wrapped;
                     if (row.cell_count)
                         memcpy(cached->cells,
                                wire->data + offset + sizeof(row),
@@ -1947,9 +1988,52 @@ static void cairo_snapshot_images(cairo_t *cr,
     }
 }
 
+typedef struct {
+    bool active, dragging;
+    uint16_t start_row, start_col;
+    uint16_t end_row, end_col;
+} ClientSelection;
+
+static void selection_bounds(const ClientSelection *selection,
+                             uint16_t *start_row, uint16_t *start_col,
+                             uint16_t *end_row, uint16_t *end_col)
+{
+    *start_row = selection->start_row;
+    *start_col = selection->start_col;
+    *end_row = selection->end_row;
+    *end_col = selection->end_col;
+    if (*start_row > *end_row
+        || (*start_row == *end_row && *start_col > *end_col)) {
+        uint16_t row = *start_row, col = *start_col;
+        *start_row = *end_row;
+        *start_col = *end_col;
+        *end_row = row;
+        *end_col = col;
+    }
+}
+
+static void cairo_selection(cairo_t *cr, const ClientSelection *selection,
+                            uint16_t cols, int cell_width, int cell_height,
+                            int pad)
+{
+    if (!selection->active || !cols) return;
+    uint16_t start_row, start_col, end_row, end_col;
+    selection_bounds(selection, &start_row, &start_col, &end_row, &end_col);
+    cairo_set_source_rgba(cr, 0.35, 0.55, 0.95, 0.45);
+    for (uint16_t row = start_row; row <= end_row; row++) {
+        uint16_t first = row == start_row ? start_col : 0;
+        uint16_t last = row == end_row ? end_col : cols - 1;
+        cairo_rectangle(cr, pad + first * cell_width,
+                        pad + row * cell_height,
+                        (last - first + 1) * cell_width, cell_height);
+    }
+    cairo_fill(cr);
+}
+
 static void cairo_render_snapshot(cairo_t *cr,
                                   const RenderClientState *client,
                                   const RenderSnapshotWire *wire,
+                                  const ClientSelection *selection,
                                   PangoFontDescription *regular,
                                   PangoFontDescription *italic,
                                   int cell_width, int cell_height,
@@ -1964,6 +2048,8 @@ static void cairo_render_snapshot(cairo_t *cr,
                           cell_width, cell_height, pad);
     cairo_snapshot_cells(cr, client, layout, regular, italic,
                          cell_width, cell_height, pad, false);
+    cairo_selection(cr, selection, header->cols,
+                    cell_width, cell_height, pad);
     cairo_snapshot_images(cr, wire, GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_TEXT,
                           cell_width, cell_height, pad);
     cairo_snapshot_cells(cr, client, layout, regular, italic,
@@ -2470,6 +2556,7 @@ typedef struct {
     int pad;
     double mouse_x, mouse_y;
     guint mouse_buttons;
+    ClientSelection selection;
     bool keys[256];
     guint socket_source;
 } GtkClient;
@@ -2525,11 +2612,80 @@ static GdkModifierType gtk_current_mods(GtkEventController *controller)
     return gtk_event_controller_get_current_event_state(controller);
 }
 
+static void gtk_selection_position(GtkClient *client, double x, double y,
+                                   uint16_t *row, uint16_t *col)
+{
+    if (!client->render.header.rows || !client->render.header.cols) {
+        *row = *col = 0;
+        return;
+    }
+    int r = ((int)y - client->pad) / client->cell_height;
+    int c = ((int)x - client->pad) / client->cell_width;
+    if (r < 0) r = 0;
+    if (c < 0) c = 0;
+    if (r >= client->render.header.rows) r = client->render.header.rows - 1;
+    if (c >= client->render.header.cols) c = client->render.header.cols - 1;
+    *row = (uint16_t)r;
+    *col = (uint16_t)c;
+}
+
+static const SnapshotCell *cached_cell(const CachedRow *row, uint16_t col)
+{
+    for (uint16_t i = 0; i < row->cell_count; i++)
+        if (row->cells[i].col == col) return &row->cells[i];
+    return NULL;
+}
+
+static void gtk_copy_selection(GtkClient *client)
+{
+    if (!client->selection.active) return;
+    uint16_t start_row, start_col, end_row, end_col;
+    selection_bounds(&client->selection, &start_row, &start_col,
+                     &end_row, &end_col);
+    GString *text = g_string_new(NULL);
+    if (!text) return;
+    for (uint16_t row = start_row; row <= end_row; row++) {
+        uint16_t first = row == start_row ? start_col : 0;
+        uint16_t last = row == end_row
+            ? end_col : client->render.header.cols - 1;
+        gsize line_start = text->len;
+        if (row < client->render.row_count) {
+            const CachedRow *cached = &client->render.rows[row];
+            for (uint16_t col = first; col <= last; col++) {
+                const SnapshotCell *cell = cached_cell(cached, col);
+                if (cell && cell->wide != GHOSTTY_CELL_WIDE_SPACER_TAIL
+                    && cell->wide != GHOSTTY_CELL_WIDE_SPACER_HEAD
+                    && cell->has_text)
+                    g_string_append(text, cell->text);
+                else if (!cell
+                         || (cell->wide != GHOSTTY_CELL_WIDE_SPACER_TAIL
+                             && cell->wide != GHOSTTY_CELL_WIDE_SPACER_HEAD))
+                    g_string_append_c(text, ' ');
+            }
+        }
+        while (text->len > line_start
+               && text->str[text->len - 1] == ' ')
+            g_string_truncate(text, text->len - 1);
+        if (row != end_row
+            && (row >= client->render.row_count
+                || !client->render.rows[row].wrapped))
+            g_string_append_c(text, '\n');
+    }
+    gdk_clipboard_set_text(gtk_widget_get_clipboard(client->area), text->str);
+    g_string_free(text, TRUE);
+}
+
 static gboolean gtk_key_pressed(GtkEventControllerKey *controller,
                                 guint keyval, guint keycode,
                                 GdkModifierType state, gpointer userdata)
 {
     GtkClient *client = userdata;
+    if ((state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
+            == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)
+        && (keyval == GDK_KEY_c || keyval == GDK_KEY_C)) {
+        gtk_copy_selection(client);
+        return TRUE;
+    }
     InputKey message = {
         .key = gdk_key_to_ghostty(keyval),
         .action = keycode < 256 && client->keys[keycode]
@@ -2558,6 +2714,12 @@ static void gtk_key_released(GtkEventControllerKey *controller,
 {
     (void)controller;
     GtkClient *client = userdata;
+    if ((state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
+            == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)
+        && (keyval == GDK_KEY_c || keyval == GDK_KEY_C)) {
+        if (keycode < 256) client->keys[keycode] = false;
+        return;
+    }
     InputKey message = {
         .key = gdk_key_to_ghostty(keyval),
         .action = GHOSTTY_KEY_ACTION_RELEASE,
@@ -2578,6 +2740,26 @@ static void gtk_mouse_click(GtkGestureClick *gesture, int presses,
         GTK_GESTURE_SINGLE(gesture));
     GhosttyMouseButton ghostty_button = gtk_mouse_button(button);
     if (ghostty_button == GHOSTTY_MOUSE_BUTTON_UNKNOWN) return;
+    if (button == 1 && !client->render.header.mouse_tracking) {
+        uint16_t row, col;
+        gtk_selection_position(client, x, y, &row, &col);
+        if (action == GHOSTTY_MOUSE_ACTION_PRESS) {
+            client->selection = (ClientSelection){
+                .active = true,
+                .dragging = true,
+                .start_row = row,
+                .start_col = col,
+                .end_row = row,
+                .end_col = col,
+            };
+        } else {
+            client->selection.end_row = row;
+            client->selection.end_col = col;
+            client->selection.dragging = false;
+        }
+        gtk_widget_queue_draw(client->area);
+        return;
+    }
     if (action == GHOSTTY_MOUSE_ACTION_PRESS)
         client->mouse_buttons |= 1u << (button < 31 ? button : 0);
     else
@@ -2616,6 +2798,15 @@ static void gtk_mouse_motion(GtkEventControllerMotion *controller,
     GtkClient *client = userdata;
     client->mouse_x = x;
     client->mouse_y = y;
+    if (!client->render.header.mouse_tracking) {
+        if (client->selection.dragging) {
+            gtk_selection_position(client, x, y,
+                                   &client->selection.end_row,
+                                   &client->selection.end_col);
+            gtk_widget_queue_draw(client->area);
+        }
+        return;
+    }
     InputMouse message = {
         .action = GHOSTTY_MOUSE_ACTION_MOTION,
         .mods = gdk_mods(gtk_current_mods(GTK_EVENT_CONTROLLER(controller))),
@@ -2685,6 +2876,7 @@ static void gtk_draw(GtkDrawingArea *area, cairo_t *cr,
         gtk_client_send(client, INPUT_RESIZE, &resize, sizeof(resize));
     }
     cairo_render_snapshot(cr, &client->render, &client->snapshot,
+                          &client->selection,
                           client->regular, client->italic,
                           client->cell_width, client->cell_height,
                           client->pad, width, height);
@@ -2802,9 +2994,9 @@ static int run_client(int socket_fd)
     client.italic = pango_font_description_copy(client.regular);
     pango_font_description_set_style(client.italic, PANGO_STYLE_ITALIC);
 #if GLIB_CHECK_VERSION(2, 74, 0)
-    GApplicationFlags flags = G_APPLICATION_DEFAULT_FLAGS;
+    GApplicationFlags flags = G_APPLICATION_NON_UNIQUE;
 #else
-    GApplicationFlags flags = G_APPLICATION_FLAGS_NONE;
+    GApplicationFlags flags = G_APPLICATION_NON_UNIQUE;
 #endif
     client.application = gtk_application_new("io.github.mjkpolo.gmux", flags);
     g_signal_connect(client.application, "activate",
