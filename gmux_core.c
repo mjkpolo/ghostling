@@ -755,203 +755,6 @@ static int utf8_encode(uint32_t cp, char out[4])
 }
 
 #ifdef GMUX_CLIENT
-#if 0 /* Replaced by GDK event-controller callbacks near run_client. */
-// Map a raylib mouse button to a GhosttyMouseButton.
-static GhosttyMouseButton raylib_mouse_to_ghostty(int rl_button)
-{
-    switch (rl_button) {
-    case MOUSE_BUTTON_LEFT:    return GHOSTTY_MOUSE_BUTTON_LEFT;
-    case MOUSE_BUTTON_RIGHT:   return GHOSTTY_MOUSE_BUTTON_RIGHT;
-    case MOUSE_BUTTON_MIDDLE:  return GHOSTTY_MOUSE_BUTTON_MIDDLE;
-    case MOUSE_BUTTON_SIDE:    return GHOSTTY_MOUSE_BUTTON_FOUR;
-    case MOUSE_BUTTON_EXTRA:   return GHOSTTY_MOUSE_BUTTON_FIVE;
-    case MOUSE_BUTTON_FORWARD: return GHOSTTY_MOUSE_BUTTON_SIX;
-    case MOUSE_BUTTON_BACK:    return GHOSTTY_MOUSE_BUTTON_SEVEN;
-    default:                   return GHOSTTY_MOUSE_BUTTON_UNKNOWN;
-    }
-}
-
-// Poll Raylib and copy only actual mouse activity into wire records.
-// Encoding stays on the receiving side because terminal modes determine
-// whether and how the application should receive each event.
-static void collect_mouse(InputWire *wire)
-{
-    static const int buttons[] = {
-        MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT, MOUSE_BUTTON_MIDDLE,
-        MOUSE_BUTTON_SIDE, MOUSE_BUTTON_EXTRA, MOUSE_BUTTON_FORWARD,
-        MOUSE_BUTTON_BACK,
-    };
-    Vector2 delta = GetMouseDelta();
-    float wheel = GetMouseWheelMove();
-    bool button_event = false;
-    for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++) {
-        if (IsMouseButtonPressed(buttons[i])
-            || IsMouseButtonReleased(buttons[i])) {
-            button_event = true;
-            break;
-        }
-    }
-
-    // Raylib still polls input every frame, but idle frames stop here without
-    // crossing the libghostty boundary.
-    if (!button_event && delta.x == 0.0f && delta.y == 0.0f && wheel == 0.0f)
-        return;
-
-    bool any_pressed = IsMouseButtonDown(MOUSE_BUTTON_LEFT)
-                    || IsMouseButtonDown(MOUSE_BUTTON_RIGHT)
-                    || IsMouseButtonDown(MOUSE_BUTTON_MIDDLE);
-    Vector2 pos = GetMousePosition();
-    InputMouse message = {
-        .mods = get_ghostty_mods(),
-        .x = pos.x,
-        .y = pos.y,
-        .any_button_pressed = any_pressed,
-    };
-
-    // Check each mouse button for press/release events.
-    for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++) {
-        int rl_btn = buttons[i];
-        GhosttyMouseButton gbtn = raylib_mouse_to_ghostty(rl_btn);
-        if (gbtn == GHOSTTY_MOUSE_BUTTON_UNKNOWN)
-            continue;
-
-        if (IsMouseButtonPressed(rl_btn)) {
-            message.action = GHOSTTY_MOUSE_ACTION_PRESS;
-            message.button = gbtn;
-            message.has_button = true;
-            input_append(wire, INPUT_MOUSE, &message, sizeof(message));
-        } else if (IsMouseButtonReleased(rl_btn)) {
-            message.action = GHOSTTY_MOUSE_ACTION_RELEASE;
-            message.button = gbtn;
-            message.has_button = true;
-            input_append(wire, INPUT_MOUSE, &message, sizeof(message));
-        }
-    }
-
-    // Mouse motion — send a motion event with whatever button is held
-    // (or no button for pure motion in any-event tracking mode).
-    if (delta.x != 0.0f || delta.y != 0.0f) {
-        message.action = GHOSTTY_MOUSE_ACTION_MOTION;
-        message.has_button = true;
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
-            message.button = GHOSTTY_MOUSE_BUTTON_LEFT;
-        else if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
-            message.button = GHOSTTY_MOUSE_BUTTON_RIGHT;
-        else if (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE))
-            message.button = GHOSTTY_MOUSE_BUTTON_MIDDLE;
-        else
-            message.has_button = false;
-        input_append(wire, INPUT_MOUSE, &message, sizeof(message));
-    }
-
-    // Scroll wheel handling.  When a mouse tracking mode is active the
-    // wheel events are forwarded to the application as button 4/5
-    // press+release pairs.  Otherwise we scroll the viewport through
-    // the scrollback buffer so the user can review history.
-    if (wheel != 0.0f) {
-        message.wheel = wheel > 0.0f ? 1 : -1;
-        message.has_button = false;
-        input_append(wire, INPUT_MOUSE, &message, sizeof(message));
-    }
-}
-
-// Poll Raylib and copy platform key information into wire records. The
-// receiving side runs libghostty's key encoder against authoritative modes.
-static void collect_input(InputWire *wire)
-{
-    // Drain printable characters from raylib's input queue.  We collect
-    // them into a single UTF-8 buffer so the encoder can attach text
-    // to the key event.
-    char char_utf8[64];
-    int char_utf8_len = 0;
-    int ch;
-    while ((ch = GetCharPressed()) != 0) {
-        char u8[4];
-        int n = utf8_encode(ch, u8);
-        if (char_utf8_len + n < (int)sizeof(char_utf8)) {
-            memcpy(&char_utf8[char_utf8_len], u8, n);
-            char_utf8_len += n;
-        }
-    }
-
-    // All raylib keys we want to check for press/repeat events.
-    // Letters and digits are handled via ranges; everything else is
-    // enumerated explicitly.
-    static const int special_keys[] = {
-        KEY_SPACE, KEY_ENTER, KEY_TAB, KEY_BACKSPACE, KEY_DELETE,
-        KEY_ESCAPE, KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT,
-        KEY_HOME, KEY_END, KEY_PAGE_UP, KEY_PAGE_DOWN, KEY_INSERT,
-        KEY_MINUS, KEY_EQUAL, KEY_LEFT_BRACKET, KEY_RIGHT_BRACKET,
-        KEY_BACKSLASH, KEY_SEMICOLON, KEY_APOSTROPHE, KEY_COMMA,
-        KEY_PERIOD, KEY_SLASH, KEY_GRAVE,
-        KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6,
-        KEY_F7, KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12,
-    };
-
-    // Build the set of raylib keys to scan: letters + digits + specials.
-    int keys_to_check[26 + 10 + sizeof(special_keys) / sizeof(special_keys[0])];
-    int num_keys = 0;
-    for (int k = KEY_A; k <= KEY_Z; k++)
-        keys_to_check[num_keys++] = k;
-    for (int k = KEY_ZERO; k <= KEY_NINE; k++)
-        keys_to_check[num_keys++] = k;
-    for (size_t i = 0; i < sizeof(special_keys) / sizeof(special_keys[0]); i++)
-        keys_to_check[num_keys++] = special_keys[i];
-
-    GhosttyMods mods = get_ghostty_mods();
-    for (int i = 0; i < num_keys; i++) {
-        int rl_key = keys_to_check[i];
-        bool pressed  = IsKeyPressed(rl_key);
-        bool repeated = IsKeyPressedRepeat(rl_key);
-        bool released = IsKeyReleased(rl_key);
-        if (!pressed && !repeated && !released)
-            continue;
-
-        GhosttyKey gkey = raylib_key_to_ghostty(rl_key);
-        if (gkey == GHOSTTY_KEY_UNIDENTIFIED)
-            continue;
-
-        GhosttyKeyAction action = released  ? GHOSTTY_KEY_ACTION_RELEASE
-                                : pressed   ? GHOSTTY_KEY_ACTION_PRESS
-                                            : GHOSTTY_KEY_ACTION_REPEAT;
-
-        // The unshifted codepoint is the character the key produces
-        // with no modifiers.  The Kitty protocol needs it to identify
-        // keys independent of the current shift state.
-        uint32_t ucp = raylib_key_unshifted_codepoint(rl_key);
-        // Consumed mods are modifiers the platform's text input
-        // already accounted for when producing the UTF-8 text.
-        // For printable keys, shift is consumed (it turns 'a' → 'A').
-        // For non-printable keys nothing is consumed.
-        GhosttyMods consumed = 0;
-        if (ucp != 0 && (mods & GHOSTTY_MODS_SHIFT))
-            consumed |= GHOSTTY_MODS_SHIFT;
-        InputKey message = {
-            .key = gkey,
-            .action = action,
-            .mods = mods,
-            .consumed_mods = consumed,
-            .unshifted_codepoint = ucp,
-        };
-        if (char_utf8_len > 0 && !released) {
-            message.text_len = (uint8_t)char_utf8_len;
-            memcpy(message.text, char_utf8, (size_t)char_utf8_len);
-            char_utf8_len = 0;
-        }
-        input_append(wire, INPUT_KEY, &message, sizeof(message));
-    }
-
-    // Fallback: on some platforms (e.g. VMs) the character event arrives
-    // a frame after the key-press event.  If we collected UTF-8 text but
-    // no key event consumed it, write it directly to the PTY so input
-    // isn't silently dropped.
-    if (char_utf8_len > 0) {
-        InputKey message = { .text_len = (uint8_t)char_utf8_len };
-        memcpy(message.text, char_utf8, (size_t)char_utf8_len);
-        input_append(wire, INPUT_KEY, &message, sizeof(message));
-    }
-}
-#endif
 
 #endif
 #ifdef GMUX_SERVER
@@ -1109,32 +912,10 @@ static bool apply_input_wire(InputWire *wire, int pty_fd,
 
 #endif
 #ifdef GMUX_CLIENT
-#if 0 /* Raylib texture lifetime support; GTK draws from the snapshot. */
-// Deferred texture cleanup — textures uploaded during a frame can't be
-// freed until after EndDrawing() flushes the draw commands to the GPU.
-#define MAX_DEFERRED_TEXTURES 256
-static Texture2D deferred_textures[MAX_DEFERRED_TEXTURES];
-static int deferred_texture_count = 0;
-
-static void defer_unload_texture(Texture2D tex)
-{
-    if (deferred_texture_count < MAX_DEFERRED_TEXTURES)
-        deferred_textures[deferred_texture_count++] = tex;
-    else
-        UnloadTexture(tex); // overflow fallback — may glitch but won't leak
-}
-
-static void flush_deferred_textures(void)
-{
-    for (int i = 0; i < deferred_texture_count; i++)
-        UnloadTexture(deferred_textures[i]);
-    deferred_texture_count = 0;
-}
-#endif
 
 #endif
 // Semantic render snapshot. The producer copies libghostty's render values;
-// the consumer performs all Raylib-specific layout and drawing.
+// the client performs toolkit-specific layout and drawing.
 typedef struct { uint8_t *data; size_t len, cap; } RenderSnapshotWire;
 typedef enum {
     SNAPSHOT_HEADER = 1,
@@ -1160,7 +941,11 @@ typedef struct {
 typedef struct {
     uint16_t col;
     SnapshotRgb foreground, background;
-    bool has_text, has_background, italic, bold;
+    SnapshotRgb underline_color;
+    bool has_text, has_background, has_underline_color;
+    bool bold, italic, faint, blink, inverse, invisible;
+    bool strikethrough, overline;
+    uint8_t underline;
     char text[64];
 } SnapshotCell;
 typedef struct {
@@ -1270,18 +1055,34 @@ static bool snapshot_pack(const RenderSnapshotWire *wire,
             for (uint16_t i = 0; i < row.cell_count; i++) {
                 const SnapshotCell *cell = &cells[i];
                 size_t text_len = strnlen(cell->text, sizeof(cell->text));
-                msgpack_pack_array(&packer, 8);
+                msgpack_pack_array(&packer, 17);
                 msgpack_pack_uint16(&packer, cell->col);
                 pack_rgb(&packer, cell->foreground);
                 pack_rgb(&packer, cell->background);
+                pack_rgb(&packer, cell->underline_color);
                 cell->has_text ? msgpack_pack_true(&packer)
                                : msgpack_pack_false(&packer);
                 cell->has_background ? msgpack_pack_true(&packer)
                                      : msgpack_pack_false(&packer);
-                cell->italic ? msgpack_pack_true(&packer)
-                             : msgpack_pack_false(&packer);
+                cell->has_underline_color ? msgpack_pack_true(&packer)
+                                          : msgpack_pack_false(&packer);
                 cell->bold ? msgpack_pack_true(&packer)
                            : msgpack_pack_false(&packer);
+                cell->italic ? msgpack_pack_true(&packer)
+                             : msgpack_pack_false(&packer);
+                cell->faint ? msgpack_pack_true(&packer)
+                            : msgpack_pack_false(&packer);
+                cell->blink ? msgpack_pack_true(&packer)
+                            : msgpack_pack_false(&packer);
+                cell->inverse ? msgpack_pack_true(&packer)
+                              : msgpack_pack_false(&packer);
+                cell->invisible ? msgpack_pack_true(&packer)
+                                : msgpack_pack_false(&packer);
+                cell->strikethrough ? msgpack_pack_true(&packer)
+                                    : msgpack_pack_false(&packer);
+                cell->overline ? msgpack_pack_true(&packer)
+                               : msgpack_pack_false(&packer);
+                msgpack_pack_uint8(&packer, cell->underline);
                 msgpack_pack_str(&packer, text_len);
                 msgpack_pack_str_body(&packer, cell->text, text_len);
             }
@@ -1380,23 +1181,48 @@ static bool snapshot_unpack(const void *data, size_t len,
             for (uint16_t j = 0; j < row.cell_count; j++) {
                 msgpack_object cell_object = field[2].via.array.ptr[j];
                 if (cell_object.type != MSGPACK_OBJECT_ARRAY
-                    || cell_object.via.array.size != 8) goto fail;
+                    || (cell_object.via.array.size != 8
+                        && cell_object.via.array.size != 17)) goto fail;
                 msgpack_object *cell_field = cell_object.via.array.ptr;
                 uint64_t col;
                 SnapshotCell cell = {0};
                 if (!object_u64(cell_field[0], &col)
                     || !unpack_rgb(cell_field[1], &cell.foreground)
-                    || !unpack_rgb(cell_field[2], &cell.background)
-                    || !object_bool(cell_field[3], &cell.has_text)
-                    || !object_bool(cell_field[4], &cell.has_background)
-                    || !object_bool(cell_field[5], &cell.italic)
-                    || !object_bool(cell_field[6], &cell.bold)
-                    || cell_field[7].type != MSGPACK_OBJECT_STR
-                    || cell_field[7].via.str.size >= sizeof(cell.text))
-                    goto fail;
+                    || !unpack_rgb(cell_field[2], &cell.background)) goto fail;
+                uint32_t text_index;
+                if (cell_object.via.array.size == 8) {
+                    // Compatibility with the first published Rocky server.
+                    if (!object_bool(cell_field[3], &cell.has_text)
+                        || !object_bool(cell_field[4], &cell.has_background)
+                        || !object_bool(cell_field[5], &cell.italic)
+                        || !object_bool(cell_field[6], &cell.bold)) goto fail;
+                    text_index = 7;
+                } else {
+                    uint64_t underline;
+                    if (!unpack_rgb(cell_field[3], &cell.underline_color)
+                        || !object_bool(cell_field[4], &cell.has_text)
+                        || !object_bool(cell_field[5], &cell.has_background)
+                        || !object_bool(cell_field[6],
+                                        &cell.has_underline_color)
+                        || !object_bool(cell_field[7], &cell.bold)
+                        || !object_bool(cell_field[8], &cell.italic)
+                        || !object_bool(cell_field[9], &cell.faint)
+                        || !object_bool(cell_field[10], &cell.blink)
+                        || !object_bool(cell_field[11], &cell.inverse)
+                        || !object_bool(cell_field[12], &cell.invisible)
+                        || !object_bool(cell_field[13], &cell.strikethrough)
+                        || !object_bool(cell_field[14], &cell.overline)
+                        || !object_u64(cell_field[15], &underline)
+                        || underline > UINT8_MAX) goto fail;
+                    cell.underline = (uint8_t)underline;
+                    text_index = 16;
+                }
+                if (cell_field[text_index].type != MSGPACK_OBJECT_STR
+                    || cell_field[text_index].via.str.size
+                        >= sizeof(cell.text)) goto fail;
                 cell.col = (uint16_t)col;
-                memcpy(cell.text, cell_field[7].via.str.ptr,
-                       cell_field[7].via.str.size);
+                memcpy(cell.text, cell_field[text_index].via.str.ptr,
+                       cell_field[text_index].via.str.size);
                 if (!snapshot_append(wire, &cell, sizeof(cell))) goto fail;
             }
         } else if (kind == SNAPSHOT_IMAGE && message.via.array.size == 15
@@ -1491,14 +1317,23 @@ static SnapshotRgb snapshot_rgb(GhosttyColorRgb color)
     return (SnapshotRgb){ color.r, color.g, color.b };
 }
 
+static bool snapshot_style_color(GhosttyStyleColor color,
+                                 const GhosttyRenderStateColors *colors,
+                                 SnapshotRgb *out)
+{
+    if (color.tag == GHOSTTY_STYLE_COLOR_RGB) {
+        *out = snapshot_rgb(color.value.rgb);
+        return true;
+    }
+    if (color.tag == GHOSTTY_STYLE_COLOR_PALETTE) {
+        *out = snapshot_rgb(colors->palette[color.value.palette]);
+        return true;
+    }
+    return false;
+}
+
 #endif
 #ifdef GMUX_CLIENT
-#if 0 /* Raylib color conversion; Cairo consumes SnapshotRgb directly. */
-static Color snapshot_color(SnapshotRgb color, uint8_t alpha)
-{
-    return (Color){ color.r, color.g, color.b, alpha };
-}
-#endif
 
 #endif
 static bool snapshot_append(RenderSnapshotWire *wire,
@@ -1726,8 +1561,17 @@ static void serialize_render_snapshot(
             }
             cell.foreground = snapshot_rgb(fg);
             cell.background = snapshot_rgb(bg);
-            cell.italic = style.italic;
             cell.bold = style.bold;
+            cell.italic = style.italic;
+            cell.faint = style.faint;
+            cell.blink = style.blink;
+            cell.inverse = style.inverse;
+            cell.invisible = style.invisible;
+            cell.strikethrough = style.strikethrough;
+            cell.overline = style.overline;
+            cell.underline = (uint8_t)style.underline;
+            cell.has_underline_color = snapshot_style_color(
+                style.underline_color, &colors, &cell.underline_color);
 
             if (grapheme_len) {
                 uint32_t codepoints[16];
@@ -1865,120 +1709,93 @@ static void render_client_free(RenderClientState *client)
     *client = (RenderClientState){0};
 }
 
-#if 0 /* Superseded by the Cairo/Pango renderer below. */
-static void render_snapshot_images(
-    const RenderSnapshotWire *wire, GhosttyKittyPlacementLayer layer,
-    int cell_width, int cell_height, int pad)
-{
-    size_t offset = 0;
-    while (offset + sizeof(SnapshotRecord) <= wire->len) {
-        SnapshotRecord record;
-        memcpy(&record, wire->data + offset, sizeof(record));
-        offset += sizeof(record);
-        if (offset + record.size > wire->len) return;
-        if (record.kind == SNAPSHOT_IMAGE
-            && record.size >= sizeof(SnapshotImage)) {
-            SnapshotImage image;
-            memcpy(&image, wire->data + offset, sizeof(image));
-            if (image.layer == (int32_t)layer
-                && sizeof(image) + image.pixel_len <= record.size) {
-                Image source = {
-                    .data = wire->data + offset + sizeof(image),
-                    .width = (int)image.image_w,
-                    .height = (int)image.image_h,
-                    .mipmaps = 1,
-                    .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
-                };
-                Texture2D texture = LoadTextureFromImage(source);
-                SetTextureFilter(texture, TEXTURE_FILTER_BILINEAR);
-                DrawTexturePro(texture,
-                    (Rectangle){image.src_x, image.src_y,
-                                image.src_w, image.src_h},
-                    (Rectangle){
-                        pad + image.viewport_col * cell_width + image.x_offset,
-                        pad + image.viewport_row * cell_height + image.y_offset,
-                        image.grid_cols * cell_width,
-                        image.grid_rows * cell_height},
-                    (Vector2){0, 0}, 0, WHITE);
-                defer_unload_texture(texture);
-            }
-        }
-        offset += record.size;
-    }
-}
-
-static void render_snapshot_cells(const RenderClientState *client,
-                                  Font font, Font italic_font,
-                                  int cell_width, int cell_height,
-                                  int font_size, int pad, bool text_pass)
-{
-    for (uint16_t row = 0; row < client->row_count; row++) {
-        const CachedRow *cached = &client->rows[row];
-        for (uint16_t i = 0; i < cached->cell_count; i++) {
-            const SnapshotCell *cell = &cached->cells[i];
-            int x = pad + cell->col * cell_width;
-            int y = pad + row * cell_height;
-            if (!text_pass && cell->has_background) {
-                DrawRectangle(x, y, cell_width, cell_height,
-                    snapshot_color(cell->background, 255));
-            } else if (text_pass && cell->has_text) {
-                Font use_font = cell->italic ? italic_font : font;
-                Color color = snapshot_color(cell->foreground, 255);
-                DrawTextEx(use_font, cell->text, (Vector2){x, y},
-                           font_size, 0, color);
-                if (cell->bold)
-                    DrawTextEx(use_font, cell->text, (Vector2){x + 1, y},
-                               font_size, 0, color);
-            }
-        }
-    }
-}
-
-static void render_snapshot(const RenderClientState *client,
-                            const RenderSnapshotWire *wire,
-                            Font font, Font italic_font,
-                            int cell_width, int cell_height,
-                            int font_size, int pad)
-{
-    const SnapshotHeader *header = &client->header;
-
-    render_snapshot_images(wire, GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_BG,
-                           cell_width, cell_height, pad);
-    render_snapshot_cells(client, font, italic_font,
-                          cell_width, cell_height, font_size, pad, false);
-    render_snapshot_images(wire, GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_TEXT,
-                           cell_width, cell_height, pad);
-    render_snapshot_cells(client, font, italic_font,
-                          cell_width, cell_height, font_size, pad, true);
-
-    if (header->cursor_visible) {
-        DrawRectangle(pad + header->cursor_col * cell_width,
-                      pad + header->cursor_row * cell_height,
-                      cell_width, cell_height,
-                      snapshot_color(header->cursor_color, 128));
-    }
-
-    render_snapshot_images(wire, GHOSTTY_KITTY_PLACEMENT_LAYER_ABOVE_TEXT,
-                           cell_width, cell_height, pad);
-
-    if (header->scrollbar_visible) {
-        int screen_height = GetScreenHeight();
-        int thumb_height = (int)(screen_height
-            * ((double)header->scrollbar_len / header->scrollbar_total));
-        if (thumb_height < 10) thumb_height = 10;
-        double fraction = (double)header->scrollbar_offset
-            / (header->scrollbar_total - header->scrollbar_len);
-        int thumb_y = (int)(fraction * (screen_height - thumb_height));
-        DrawRectangle(GetScreenWidth() - 8, thumb_y, 6, thumb_height,
-                      (Color){200, 200, 200, 128});
-    }
-}
-#endif
 
 static void cairo_color(cairo_t *cr, SnapshotRgb color, double alpha)
 {
     cairo_set_source_rgba(cr, color.r / 255.0, color.g / 255.0,
                          color.b / 255.0, alpha);
+}
+
+static void cairo_cell_decorations(cairo_t *cr, const SnapshotCell *cell,
+                                   double x, double y,
+                                   int cell_width, int cell_height,
+                                   double alpha)
+{
+    SnapshotRgb color = cell->has_underline_color
+        ? cell->underline_color : cell->foreground;
+    cairo_save(cr);
+    cairo_color(cr, color, alpha);
+    cairo_set_line_width(cr, 1.0);
+
+    if (cell->underline) {
+        double baseline = y + cell_height - 2.0;
+        if (cell->underline == GHOSTTY_SGR_UNDERLINE_CURLY) {
+            double step = cell_width / 4.0;
+            cairo_move_to(cr, x, baseline);
+            cairo_curve_to(cr, x + step, baseline - 2.0,
+                           x + step, baseline + 2.0,
+                           x + 2.0 * step, baseline);
+            cairo_curve_to(cr, x + 3.0 * step, baseline - 2.0,
+                           x + 3.0 * step, baseline + 2.0,
+                           x + cell_width, baseline);
+        } else {
+            if (cell->underline == GHOSTTY_SGR_UNDERLINE_DOTTED) {
+                const double dash[] = { 1.0, 2.0 };
+                cairo_set_dash(cr, dash, 2, 0);
+            } else if (cell->underline == GHOSTTY_SGR_UNDERLINE_DASHED) {
+                const double dash[] = { 3.0, 2.0 };
+                cairo_set_dash(cr, dash, 2, 0);
+            }
+            cairo_move_to(cr, x, baseline);
+            cairo_line_to(cr, x + cell_width, baseline);
+            if (cell->underline == GHOSTTY_SGR_UNDERLINE_DOUBLE) {
+                cairo_move_to(cr, x, baseline - 2.0);
+                cairo_line_to(cr, x + cell_width, baseline - 2.0);
+            }
+        }
+        cairo_stroke(cr);
+        cairo_set_dash(cr, NULL, 0, 0);
+    }
+    if (cell->strikethrough) {
+        cairo_move_to(cr, x, y + cell_height * 0.5);
+        cairo_line_to(cr, x + cell_width, y + cell_height * 0.5);
+        cairo_stroke(cr);
+    }
+    if (cell->overline) {
+        cairo_move_to(cr, x, y + 1.0);
+        cairo_line_to(cr, x + cell_width, y + 1.0);
+        cairo_stroke(cr);
+    }
+    cairo_restore(cr);
+}
+
+static bool snapshot_rgb_equal(SnapshotRgb a, SnapshotRgb b)
+{
+    return a.r == b.r && a.g == b.g && a.b == b.b;
+}
+
+// Return whether Pango may shape two neighboring cells as one text run.
+// Backgrounds intentionally do not participate: they are painted in a
+// separate pass, and allowing them to differ preserves shaping across syntax
+// highlighting that changes only the background.
+static bool cells_shape_together(const SnapshotCell *a,
+                                 const SnapshotCell *b)
+{
+    return a->has_text && b->has_text
+        && !a->invisible && !b->invisible
+        && b->col == a->col + 1
+        && snapshot_rgb_equal(a->foreground, b->foreground)
+        && a->bold == b->bold
+        && a->italic == b->italic
+        && a->faint == b->faint
+        && a->blink == b->blink
+        && a->inverse == b->inverse
+        && a->strikethrough == b->strikethrough
+        && a->overline == b->overline
+        && a->underline == b->underline
+        && a->has_underline_color == b->has_underline_color
+        && (!a->has_underline_color
+            || snapshot_rgb_equal(a->underline_color, b->underline_color));
 }
 
 static void cairo_snapshot_cells(cairo_t *cr,
@@ -1991,26 +1808,74 @@ static void cairo_snapshot_cells(cairo_t *cr,
 {
     for (uint16_t row = 0; row < client->row_count; row++) {
         const CachedRow *cached = &client->rows[row];
-        for (uint16_t i = 0; i < cached->cell_count; i++) {
-            const SnapshotCell *cell = &cached->cells[i];
-            double x = pad + cell->col * cell_width;
-            double y = pad + row * cell_height;
-            if (!text_pass && cell->has_background) {
+        if (!text_pass) {
+            for (uint16_t i = 0; i < cached->cell_count; i++) {
+                const SnapshotCell *cell = &cached->cells[i];
+                if (!cell->has_background) continue;
+                double x = pad + cell->col * cell_width;
+                double y = pad + row * cell_height;
                 cairo_color(cr, cell->background, 1.0);
                 cairo_rectangle(cr, x, y, cell_width, cell_height);
                 cairo_fill(cr);
-            } else if (text_pass && cell->has_text) {
-                pango_layout_set_font_description(
-                    layout, cell->italic ? italic : regular);
-                pango_layout_set_text(layout, cell->text, -1);
-                cairo_color(cr, cell->foreground, 1.0);
-                cairo_move_to(cr, x, y);
-                pango_cairo_show_layout(cr, layout);
-                if (cell->bold) {
-                    cairo_move_to(cr, x + 1, y);
-                    pango_cairo_show_layout(cr, layout);
-                }
             }
+            continue;
+        }
+
+        // Shape a compatible sequence once so HarfBuzz can apply ligatures
+        // and contextual alternates such as Monaspace texture healing. The
+        // logical terminal grid remains cell based; only glyph ink may cross
+        // the internal boundaries of this run.
+        uint16_t i = 0;
+        while (i < cached->cell_count) {
+            const SnapshotCell *first = &cached->cells[i];
+            if (!first->has_text || first->invisible) {
+                i++;
+                continue;
+            }
+            uint16_t end = i + 1;
+            while (end < cached->cell_count
+                   && cells_shape_together(&cached->cells[end - 1],
+                                           &cached->cells[end])) {
+                // Keep the cursor cell isolated so moving the cursor through
+                // a ligature exposes the underlying terminal characters.
+                if (client->header.cursor_visible
+                    && client->header.cursor_row == row
+                    && (cached->cells[end - 1].col
+                            == client->header.cursor_col
+                        || cached->cells[end].col
+                            == client->header.cursor_col))
+                    break;
+                end++;
+            }
+
+            GString *text = g_string_sized_new(
+                (gsize)(end - i) * sizeof(first->text));
+            if (!text) return;
+            for (uint16_t j = i; j < end; j++)
+                g_string_append(text, cached->cells[j].text);
+
+            double x = pad + first->col * cell_width;
+            double y = pad + row * cell_height;
+            double alpha = first->faint ? 0.5 : 1.0;
+            pango_layout_set_font_description(
+                layout, first->italic ? italic : regular);
+            pango_layout_set_text(layout, text->str, (int)text->len);
+            cairo_color(cr, first->foreground, alpha);
+            cairo_move_to(cr, x, y);
+            pango_cairo_show_layout(cr, layout);
+            if (first->bold) {
+                cairo_move_to(cr, x + 1, y);
+                pango_cairo_show_layout(cr, layout);
+            }
+            g_string_free(text, TRUE);
+
+            for (uint16_t j = i; j < end; j++) {
+                const SnapshotCell *cell = &cached->cells[j];
+                double cell_x = pad + cell->col * cell_width;
+                cairo_cell_decorations(cr, cell, cell_x, y,
+                                       cell_width, cell_height, alpha);
+            }
+            i = end;
         }
     }
 }
@@ -2254,9 +2119,8 @@ static void effect_title_changed(GhosttyTerminal terminal, void *userdata)
     ctx->title_changed = true;
 }
 
-// color_scheme effect — responds to CSI ? 996 n.  Raylib has no API to
-// query the OS color scheme, so we return false to silently ignore the
-// query rather than guessing.
+// color_scheme effect — responds to CSI ? 996 n. The server does not
+// know the client OS color scheme, so ignore the query rather than guessing.
 static bool effect_color_scheme(GhosttyTerminal terminal, void *userdata,
                                 GhosttyColorScheme *out_scheme)
 {
@@ -2272,40 +2136,6 @@ static bool effect_color_scheme(GhosttyTerminal terminal, void *userdata,
 // Main
 // ---------------------------------------------------------------------------
 
-#if 0 /* Raylib font atlas generation; Pango uses app-registered font files. */
-// Raylib's convenience loader assumes glyphs are no taller than font_size.
-// Box-drawing and Powerline symbols can exceed that height. Pack the original
-// glyph images using their actual bounds so neighboring atlas rows stay apart.
-static Font load_terminal_font(const unsigned char *data, int data_size,
-                               int font_size, const char *face)
-{
-    Font font = {0};
-    font.baseSize = font_size;
-    font.glyphCount = (int)(sizeof(monaspace_codepoints) / sizeof(monaspace_codepoints[0]));
-    font.glyphPadding = 4;
-    font.glyphs = LoadFontData(data, data_size, font_size, monaspace_codepoints,
-                              font.glyphCount, FONT_DEFAULT);
-    if (!font.glyphs) return font;
-
-    int max_height = font_size;
-    for (int i = 0; i < font.glyphCount; i++) {
-        if (font.glyphs[i].image.height > max_height)
-            max_height = font.glyphs[i].image.height;
-    }
-    Image atlas = GenImageFontAtlas(font.glyphs, &font.recs, font.glyphCount,
-                                   max_height, font.glyphPadding, 1);
-    if (atlas.data) {
-        font.texture = LoadTextureFromImage(atlas);
-        UnloadImage(atlas);
-    }
-    if (font.texture.id != 0) {
-        SetTextureFilter(font.texture, TEXTURE_FILTER_BILINEAR);
-        TraceLog(LOG_INFO, "FONT: Argon Frozen %s loaded (%i pixel size | %i glyphs)",
-                 face, font_size, font.glyphCount);
-    }
-    return font;
-}
-#endif
 
 #endif
 #ifdef GMUX_SERVER
@@ -2624,243 +2454,6 @@ cleanup:
     return result;
 }
 
-#if 0 /* Replaced by the event-driven GTK client below. */
-static int run_client_raylib(int socket_fd)
-{
-    int result = 1;
-    WireConnection connection = { .fd = -1 };
-    if (!wire_connection_init(&connection, socket_fd)) {
-        close(socket_fd);
-        return 1;
-    }
-
-
-    // Desired font size in logical (screen) points — the actual texture
-    // will be rasterized at font_size * dpi_scale so glyphs stay crisp on
-    // HiDPI / Retina displays.
-    const int font_size = 24;
-
-    // Enable HiDPI *before* creating the window so raylib can set up the
-    // framebuffer at the native display resolution.
-    SetConfigFlags(FLAG_WINDOW_HIGHDPI);
-
-    // Initialize window
-    InitWindow(800, 600, "gmux");
-    SetWindowState(FLAG_WINDOW_RESIZABLE);
-    SetTargetFPS(60);
-
-    // Query the DPI scale so we can rasterize the font at the true pixel
-    // size.  On a 2× Retina display this returns {2.0, 2.0}.
-    Vector2 dpi_scale = GetWindowScaleDPI();
-
-    // Load the embedded monospace font at the native pixel size so every
-    // glyph maps 1:1 to screen pixels — no texture scaling, no blur.
-    int font_size_px = (int)(font_size * dpi_scale.y);
-    // NULL would load only ASCII. Supply every Unicode character mapped by
-    // both bundled faces, including non-BMP symbols and terminal icons.
-    Font mono_font = load_terminal_font(font_monaspace_argon,
-                         (int)sizeof(font_monaspace_argon), font_size_px, "Regular");
-    Font italic_font = load_terminal_font(font_monaspace_argon_italic,
-                         (int)sizeof(font_monaspace_argon_italic), font_size_px, "Italic");
-    if (!IsFontValid(mono_font) || !IsFontValid(italic_font) ||
-        mono_font.texture.id == 0 || italic_font.texture.id == 0) {
-        TraceLog(LOG_ERROR, "Failed to load embedded terminal fonts");
-        UnloadFont(italic_font);
-        UnloadFont(mono_font);
-        CloseWindow();
-        return 1;
-    }
-
-    // Measure a representative glyph to derive the monospace cell size.
-    // MeasureTextEx returns logical-pixel dimensions (already accounts for
-    // the font's internal scaling), so divide by the DPI scale to get the
-    // screen-space cell size we use for layout.
-    Vector2 glyph_size = MeasureTextEx(mono_font, "M", font_size_px, 0);
-    int cell_width  = (int)(glyph_size.x / dpi_scale.x);
-    int cell_height = (int)(glyph_size.y / dpi_scale.y);
-
-    // Guard against zero cell dimensions — these would cause division
-    // by zero when computing the terminal grid.
-    if (cell_width < 1) cell_width = 1;
-    if (cell_height < 1) cell_height = 1;
-
-    // Small padding from window edges, in pixels.  Passed to render_terminal()
-    // and handle_mouse() so all layout uses a single value.
-    const int pad = 4;
-
-    // Compute the initial grid from the window size and measured cell
-    // metrics.
-    int scr_w = GetScreenWidth();
-    int scr_h = GetScreenHeight();
-    uint16_t term_cols = (uint16_t)((scr_w - 2 * pad) / cell_width);
-    uint16_t term_rows = (uint16_t)((scr_h - 2 * pad) / cell_height);
-    if (term_cols < 1) term_cols = 1;
-    if (term_rows < 1) term_rows = 1;
-
-    RenderTexture2D terminal_surface = {0};
-    RenderSnapshotWire client_wire = {0};
-    RenderClientState render_client = {0};
-    InputWire input_wire = {0};
-    // Raylib is an immediate-mode renderer, so skipping BeginDrawing entirely
-    // is not safe: the window must still present frames and poll events. Keep
-    // the expensive terminal rendering in a persistent texture instead. On a
-    // clean libghostty frame we only copy this texture to the window.
-    terminal_surface = LoadRenderTexture(scr_w, scr_h);
-    if (terminal_surface.texture.id == 0) {
-        fprintf(stderr, "LoadRenderTexture failed\n");
-        goto cleanup;
-    }
-
-    // Track window size so we only recalculate the grid on actual changes.
-    int prev_width = scr_w;
-    int prev_height = scr_h;
-
-    // Track focus state so we only send focus events on transitions.
-    // Initialize from the actual window state to avoid a spurious
-    // focus-lost event on startup.
-    bool prev_focused = IsWindowFocused();
-
-    Color win_bg = BLACK;
-    InputResize initial_size = {
-        .cols = term_cols,
-        .rows = term_rows,
-        .cell_width = (uint32_t)cell_width,
-        .cell_height = (uint32_t)cell_height,
-        .screen_width = (uint32_t)scr_w,
-        .screen_height = (uint32_t)scr_h,
-        .padding = pad,
-    };
-    input_append(&input_wire, INPUT_ATTACH, NULL, 0);
-    input_append(&input_wire, INPUT_RESIZE, &initial_size, sizeof(initial_size));
-    if (!input_queue(&connection, &input_wire)
-        || !wire_flush(&connection)) goto cleanup;
-
-    while (!WindowShouldClose()) {
-        if (IsWindowResized()) {
-            int w = GetScreenWidth();
-            int h = GetScreenHeight();
-            if (w != prev_width || h != prev_height) {
-                int cols = (w - 2 * pad) / cell_width;
-                int rows = (h - 2 * pad) / cell_height;
-                if (cols < 1) cols = 1;
-                if (rows < 1) rows = 1;
-                term_cols = (uint16_t)cols;
-                term_rows = (uint16_t)rows;
-                InputResize resize = {
-                    .cols = term_cols,
-                    .rows = term_rows,
-                    .cell_width = (uint32_t)cell_width,
-                    .cell_height = (uint32_t)cell_height,
-                    .screen_width = (uint32_t)w,
-                    .screen_height = (uint32_t)h,
-                    .padding = pad,
-                };
-                input_append(&input_wire, INPUT_RESIZE,
-                             &resize, sizeof(resize));
-                prev_width = w;
-                prev_height = h;
-
-                // The cached texture has window-sized coordinates, so resize
-                // it along with the window and repaint it below.
-                UnloadRenderTexture(terminal_surface);
-                terminal_surface = LoadRenderTexture(w, h);
-                if (terminal_surface.texture.id == 0) {
-                    fprintf(stderr, "LoadRenderTexture failed after resize\n");
-                    break;
-                }
-
-                // Do not present an empty texture while waiting for the
-                // server's resized snapshot. Repaint immediately from the
-                // client's last complete cell cache; the server response
-                // will replace it with the authoritative new geometry.
-                BeginTextureMode(terminal_surface);
-                ClearBackground(win_bg);
-                render_snapshot(&render_client, &client_wire,
-                                mono_font, italic_font,
-                                cell_width, cell_height, font_size, pad);
-                EndTextureMode();
-                flush_deferred_textures();
-            }
-        }
-
-        // Send focus in/out events when the window focus state changes,
-        // but only if the application has enabled focus reporting
-        // (DECSET 1004).  Sending CSI I / CSI O unconditionally would
-        // inject unexpected escape sequences into shells that never
-        // asked for them.
-        bool focused = IsWindowFocused();
-        if (focused != prev_focused) {
-            InputFocus focus = { .focused = focused };
-            input_append(&input_wire, INPUT_FOCUS, &focus, sizeof(focus));
-            prev_focused = focused;
-        }
-
-        collect_input(&input_wire);
-        collect_mouse(&input_wire);
-        if (input_wire.len && !input_queue(&connection, &input_wire)) break;
-        if (!wire_flush(&connection)) break;
-
-        bool connected = wire_read(&connection);
-        for (;;) {
-            uint8_t *packed = NULL;
-            size_t packed_len = 0;
-            int frame = wire_take_frame(&connection, &packed, &packed_len);
-            if (frame == 0) break;
-            if (frame < 0
-                || !snapshot_decode(packed, packed_len, &client_wire)) {
-                free(packed);
-                connected = false;
-                break;
-            }
-            free(packed);
-            render_client_apply(&render_client, &client_wire);
-            apply_snapshot_title(&client_wire);
-            win_bg = snapshot_color(render_client.header.background, 255);
-
-            BeginTextureMode(terminal_surface);
-            ClearBackground(win_bg);
-            render_snapshot(&render_client, &client_wire,
-                            mono_font, italic_font,
-                            cell_width, cell_height, font_size, pad);
-            EndTextureMode();
-
-            // Kitty textures were referenced while consuming the snapshot;
-            // EndTextureMode has flushed those draw operations.
-            flush_deferred_textures();
-        }
-        if (!connected) goto cleanup;
-
-        // Present the cached terminal surface every frame so Raylib can keep
-        // the window responsive even when terminal state is completely idle.
-        BeginDrawing();
-        ClearBackground(win_bg);
-        DrawTextureRec(terminal_surface.texture,
-            (Rectangle){0, 0,
-                        (float)terminal_surface.texture.width,
-                        -(float)terminal_surface.texture.height},
-            (Vector2){0, 0}, WHITE);
-
-        EndDrawing();
-    }
-
-    input_append(&input_wire, INPUT_DETACH, NULL, 0);
-    input_queue(&connection, &input_wire);
-    wire_flush(&connection);
-    result = 0;
-
-cleanup:
-    render_client_free(&render_client);
-    free(input_wire.data);
-    free(client_wire.data);
-    wire_connection_close(&connection);
-    if (terminal_surface.texture.id != 0)
-        UnloadRenderTexture(terminal_surface);
-    UnloadFont(italic_font);
-    UnloadFont(mono_font);
-    CloseWindow();
-    return result;
-}
-#endif
 
 typedef struct {
     GtkApplication *application;

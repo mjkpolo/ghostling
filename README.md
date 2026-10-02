@@ -152,17 +152,16 @@ cmake --build build --target clean
 
 ## Linux release artifacts
 
-- `gmux-server` is built on Rocky Linux 9.4 for a glibc 2.34 baseline.
-- The GTK client is distributed as `gmux.flatpak` using GNOME runtime 50.
+- `gmux` and `gmux-server` are built on Rocky Linux 9.4 for a glibc 2.34
+  baseline. Download the single `gmux-rocky-linux-9.4-x86_64` artifact and
+  copy `gmux-server` to the remote host while keeping `gmux` locally.
 
-Keep the host socket in the directory granted to the Flatpak:
+Run both binaries directly:
 
 ```sh
 mkdir -p "$XDG_RUNTIME_DIR/gmux"
 ./gmux-server "$XDG_RUNTIME_DIR/gmux/gmux.sock"
-flatpak install --user ./gmux.flatpak
-flatpak run io.github.mjkpolo.gmux --connect \
-  "/run/user/$(id -u)/gmux/gmux.sock"
+./gmux --connect "$XDG_RUNTIME_DIR/gmux/gmux.sock"
 ```
 
 ## FAQ

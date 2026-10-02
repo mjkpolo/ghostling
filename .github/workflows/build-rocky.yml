@@ -1,4 +1,4 @@
-name: Build Rocky Linux 9.4 server
+name: Build Rocky Linux 9.4 binaries
 
 on:
   push:
@@ -17,8 +17,9 @@ jobs:
           submodules: recursive
       - name: Install build dependencies
         run: >-
-          dnf -y install cmake file gcc gcc-c++ git make tar xz
-      - name: Build server
+          dnf -y install cmake file fontconfig-devel gcc gcc-c++ git
+          gtk4-devel make tar xz
+      - name: Build client and server
         run: |
           set -o pipefail
           ./ci/build-rocky.sh 2>&1 | tee rocky-build.log
@@ -30,6 +31,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: gmux-server-rocky-linux-9.4-x86_64
+          name: gmux-rocky-linux-9.4-x86_64
           path: artifacts/
           if-no-files-found: error

@@ -195,15 +195,12 @@ modes.
 
 ### Build and compatibility
 
-- Build only `gmux-server` inside the pinned `rockylinux/rockylinux:9.4` image
-  so the headless binary targets glibc 2.34.
+- Build `gmux` and `gmux-server` inside the pinned
+  `rockylinux/rockylinux:9.4` image so both target glibc 2.34.
 - Link vendored MessagePack and libghostty into the server.
 - Keep the headless server dependent only on the glibc/libm family.
-- Record its `ldd`, ELF interpreter, and GLIBC symbol requirements in the CI
-  artifact.
-- Distribute the GTK client as a Flatpak using the latest stable GNOME runtime,
-  currently GNOME 50. This supplies a consistent recent GTK independently of
-  the host distribution.
+- Record both binaries' `ldd`, ELF interpreter, and GLIBC symbol requirements
+  in the CI artifact. The client uses the host's GTK4 stack.
 
 ### 1. Fix Escape and add an input inspector
 
