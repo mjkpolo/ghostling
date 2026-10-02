@@ -164,6 +164,21 @@ mkdir -p "$XDG_RUNTIME_DIR/gmux"
 ./gmux --connect "$XDG_RUNTIME_DIR/gmux/gmux.sock"
 ```
 
+### Client configuration
+
+The GTK client loads `gmux/config` from GLib's user configuration directory.
+On Linux this is `$XDG_CONFIG_HOME`, falling back to `~/.config` when that
+variable is unset. For example, `~/.config/gmux/config` may contain:
+
+```ini
+font = Monaspace Argon Frozen
+font-size = 24
+```
+
+The font must be available through Fontconfig. `font-size` accepts integer
+sizes from 6 through 96. `Ctrl+Shift++` and `Ctrl+Shift+-` adjust the font size
+for the running client.
+
 ## FAQ
 
 ### Why Not Zig?

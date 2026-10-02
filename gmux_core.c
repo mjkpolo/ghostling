@@ -2551,6 +2551,8 @@ typedef struct {
     RenderClientState render;
     PangoFontDescription *regular;
     PangoFontDescription *italic;
+    char font_family[128];
+    int font_size;
     int cell_width, cell_height;
     int width, height;
     int pad;
@@ -2593,6 +2595,58 @@ static bool register_embedded_font(const unsigned char *data, size_t len)
     bool ok = FcConfigAppFontAddFile(NULL, (const FcChar8 *)path);
     unlink(path);
     return ok;
+}
+
+static void gtk_load_config(GtkClient *client)
+{
+    snprintf(client->font_family, sizeof(client->font_family),
+             "Monaspace Argon Frozen");
+    client->font_size = 24;
+    char *path = g_build_filename(g_get_user_config_dir(), "gmux", "config",
+                                  NULL);
+    FILE *file = fopen(path, "r");
+    g_free(path);
+    if (!file) return;
+
+    char line[256];
+    while (fgets(line, sizeof(line), file)) {
+        char *value = strchr(line, '=');
+        if (!value) continue;
+        *value++ = '\0';
+        g_strstrip(line);
+        g_strstrip(value);
+        if (strcmp(line, "font") == 0 && *value) {
+            snprintf(client->font_family, sizeof(client->font_family),
+                     "%s", value);
+        } else if (strcmp(line, "font-size") == 0) {
+            char *end = NULL;
+            long size = strtol(value, &end, 10);
+            if (end != value && *end == '\0' && size >= 6 && size <= 96)
+                client->font_size = (int)size;
+        }
+    }
+    fclose(file);
+}
+
+static void gtk_apply_font(GtkClient *client)
+{
+    pango_font_description_set_family(client->regular, client->font_family);
+    pango_font_description_set_size(client->regular,
+                                    client->font_size * PANGO_SCALE);
+    pango_font_description_set_family(client->italic, client->font_family);
+    pango_font_description_set_size(client->italic,
+                                    client->font_size * PANGO_SCALE);
+    pango_font_description_set_style(client->italic, PANGO_STYLE_ITALIC);
+    if (!client->area) return;
+    PangoLayout *measure = gtk_widget_create_pango_layout(client->area, "M");
+    pango_layout_set_font_description(measure, client->regular);
+    pango_layout_get_pixel_size(measure, &client->cell_width,
+                                &client->cell_height);
+    g_object_unref(measure);
+    if (client->cell_width < 1) client->cell_width = 1;
+    if (client->cell_height < 1) client->cell_height = 1;
+    client->width = client->height = -1;
+    gtk_widget_queue_draw(client->area);
 }
 
 static GhosttyMouseButton gtk_mouse_button(guint button)
@@ -2682,6 +2736,22 @@ static gboolean gtk_key_pressed(GtkEventControllerKey *controller,
     GtkClient *client = userdata;
     if ((state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
             == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)
+        && (keyval == GDK_KEY_plus || keyval == GDK_KEY_equal
+            || keyval == GDK_KEY_KP_Add)) {
+        if (client->font_size < 96) client->font_size++;
+        gtk_apply_font(client);
+        return TRUE;
+    }
+    if ((state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
+            == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)
+        && (keyval == GDK_KEY_minus || keyval == GDK_KEY_underscore
+            || keyval == GDK_KEY_KP_Subtract)) {
+        if (client->font_size > 6) client->font_size--;
+        gtk_apply_font(client);
+        return TRUE;
+    }
+    if ((state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
+            == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)
         && (keyval == GDK_KEY_c || keyval == GDK_KEY_C)) {
         gtk_copy_selection(client);
         return TRUE;
@@ -2716,7 +2786,11 @@ static void gtk_key_released(GtkEventControllerKey *controller,
     GtkClient *client = userdata;
     if ((state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
             == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)
-        && (keyval == GDK_KEY_c || keyval == GDK_KEY_C)) {
+        && (keyval == GDK_KEY_c || keyval == GDK_KEY_C
+            || keyval == GDK_KEY_plus || keyval == GDK_KEY_equal
+            || keyval == GDK_KEY_KP_Add || keyval == GDK_KEY_minus
+            || keyval == GDK_KEY_underscore
+            || keyval == GDK_KEY_KP_Subtract)) {
         if (keycode < 256) client->keys[keycode] = false;
         return;
     }
@@ -2934,13 +3008,7 @@ static void gtk_activate(GtkApplication *application, gpointer userdata)
                                    gtk_draw, client, NULL);
     gtk_window_set_child(client->window, client->area);
 
-    PangoLayout *measure = gtk_widget_create_pango_layout(client->area, "M");
-    pango_layout_set_font_description(measure, client->regular);
-    pango_layout_get_pixel_size(measure, &client->cell_width,
-                                &client->cell_height);
-    g_object_unref(measure);
-    if (client->cell_width < 1) client->cell_width = 1;
-    if (client->cell_height < 1) client->cell_height = 1;
+    gtk_apply_font(client);
 
     GtkEventController *key = gtk_event_controller_key_new();
     g_signal_connect(key, "key-pressed", G_CALLBACK(gtk_key_pressed), client);
@@ -2989,10 +3057,10 @@ static int run_client(int socket_fd)
                                    sizeof(font_monaspace_argon_italic))) {
         fprintf(stderr, "failed to register embedded Monaspace fonts\n");
     }
-    client.regular = pango_font_description_from_string(
-        "Monaspace Argon Frozen 24");
-    client.italic = pango_font_description_copy(client.regular);
-    pango_font_description_set_style(client.italic, PANGO_STYLE_ITALIC);
+    gtk_load_config(&client);
+    client.regular = pango_font_description_new();
+    client.italic = pango_font_description_new();
+    gtk_apply_font(&client);
 #if GLIB_CHECK_VERSION(2, 74, 0)
     GApplicationFlags flags = G_APPLICATION_NON_UNIQUE;
 #else
