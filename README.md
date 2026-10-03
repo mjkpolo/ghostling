@@ -106,9 +106,9 @@ Requirements:
 
 ```sh
 ./build.sh
-./build/gmux-server "$HOME/.gmux.sock"
-./build/gmux --connect "$HOME/.gmux.sock"
-```
+install -d -m 700 "$XDG_RUNTIME_DIR/gmux"
+./build/gmux-server "$XDG_RUNTIME_DIR/gmux/default.sock"
+./build/gmux --connect "$XDG_RUNTIME_DIR/gmux/default.sock"
 ```
 
 For a headless server build on another machine, clone with submodules and run:
@@ -150,12 +150,12 @@ To clean up the build directory:
 cmake --build build --target clean
 ```
 
-## Linux release artifacts
+## Linux releases
 
-- `gmux` and `gmux-server` are built on Rocky Linux 9.4 for a glibc 2.34
-  baseline. Download the single `gmux-rocky-linux-9.4-x86_64` artifact and
-  copy `gmux-server` and its adjacent `themes` directory to the remote host
-  while keeping `gmux` locally.
+- Every push to `gmux-codex` publishes a GitHub release containing `gmux`,
+  `gmux-server`, `gmuxctl`, themes, terminfo, and `SHA256SUMS`. The binaries
+  are built on Rocky Linux 9.4 for a glibc 2.34 baseline. The Actions run also
+  retains the combined `gmux-rocky-linux-9.4-x86_64` artifact.
 
 Run both binaries directly:
 
@@ -164,6 +164,26 @@ mkdir -p "$XDG_RUNTIME_DIR/gmux"
 ./gmux-server "$XDG_RUNTIME_DIR/gmux/gmux.sock"
 ./gmux --connect "$XDG_RUNTIME_DIR/gmux/gmux.sock"
 ```
+
+Or let the session manager provision `xterm-kitty`, create secure socket
+directories, detect stale sessions, and manage SSH Unix-socket forwarding:
+
+```sh
+./gmuxctl my-ssh-host
+```
+
+`gmuxctl` is a standalone Python script. It first looks beside itself and on
+`PATH`; if `gmux` is missing, it downloads and SHA-256 verifies the latest
+Rocky release into `$XDG_CACHE_HOME/gmux` (or `~/.cache/gmux`). If the remote
+host lacks `gmux-server`, it asks before downloading the verified server and
+copying it to `~/.local/bin` or another directory you choose. An explicit
+local build can be selected with `--client` or `--server-binary`.
+
+The manager uses `$GMUX_SOCKET_DIR`, then `$XDG_RUNTIME_DIR/gmux`, and finally
+`/tmp/gmux-$UID`. It requires the directory to be owned by the current user
+with mode `0700`; session sockets use mode `0600`. Remote `xterm-kitty`
+terminfo is installed privately under the user's data directory. No root
+access is required.
 
 ### Configuration
 

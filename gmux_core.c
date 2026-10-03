@@ -14,6 +14,7 @@
 #include <poll.h>
 #include <pwd.h>
 #include <limits.h>
+#include <math.h>
 
 #if defined(__APPLE__)
 #include <util.h>
@@ -42,8 +43,6 @@
 #include "font_monaspace_argon_bold.h"
 #include "font_monaspace_argon_bold_italic.h"
 #endif
-#include "fonts/monaspace_codepoints.h"
-
 // Keep the client and server as single translation units while grouping the
 // implementation by responsibility. This avoids an internal API layer whose
 // only purpose would be to split this small program across files.
@@ -67,8 +66,14 @@ int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
 #ifdef GMUX_SERVER
+    if (argc == 3 && strcmp(argv[1], "--check") == 0)
+        return check_server(argv[2]);
+    if (argc == 3 && strcmp(argv[1], "--kill") == 0)
+        return kill_server_process(argv[2]);
     if (argc == 2) return daemonize_server(argv[1]);
-    fprintf(stderr, "usage: %s SOCKET\n", argv[0]);
+    fprintf(stderr,
+            "usage: %s SOCKET\n       %s --check SOCKET\n"
+            "       %s --kill SOCKET\n", argv[0], argv[0], argv[0]);
 #else
     if (argc == 3 && (strcmp(argv[1], "--kill") == 0 || strcmp(argv[1], "-kill") == 0))
         return kill_server(argv[2]);

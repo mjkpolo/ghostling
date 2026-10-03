@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""Small SSH session manager for gmux."""
+
+import argparse
+import curses
+import hashlib
+import os
+from pathlib import Path
+import platform
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import stat
+import tempfile
+import time
+from urllib.error import URLError
+from urllib.request import urlopen
+
+SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+HERE = Path(__file__).resolve().parent
+RELEASE_REPOSITORY = os.environ.get(
+    "GMUX_RELEASE_REPOSITORY", "mjkpolo/ghostling")
+RELEASE_BASE = os.environ.get(
+    "GMUX_RELEASE_BASE",
+    f"https://github.com/{RELEASE_REPOSITORY}/releases/latest/download")
+
+def cache_dir():
+    root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    directory = root / "gmux"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = directory.lstat()
+    if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()):
+        raise RuntimeError(f"insecure gmux cache directory: {directory}")
+    directory.chmod(0o700)
+    return directory
+
+def release_checksums():
+    try:
+        with urlopen(f"{RELEASE_BASE}/SHA256SUMS", timeout=30) as response:
+            text = response.read().decode("ascii")
+    except (OSError, UnicodeError, URLError) as error:
+        raise RuntimeError(f"could not download gmux release checksums: {error}")
+    checksums = {}
+    for line in text.splitlines():
+        fields = line.split(None, 1)
+        if len(fields) == 2 and re.fullmatch(r"[0-9a-fA-F]{64}", fields[0]):
+            checksums[fields[1].lstrip("*")] = fields[0].lower()
+    return checksums
+
+def release_asset(name, executable=False):
+    if executable and (platform.system() != "Linux" or platform.machine() not in (
+            "x86_64", "AMD64")):
+        raise RuntimeError(
+            "published gmux binaries currently support Linux x86_64 only")
+    expected = release_checksums().get(name)
+    if not expected:
+        raise RuntimeError(f"release checksum is missing for {name}")
+    destination = cache_dir() / name
+    if destination.is_file():
+        actual = hashlib.sha256(destination.read_bytes()).hexdigest()
+        if actual == expected:
+            if executable: destination.chmod(0o700)
+            return destination
+    temporary = destination.with_name(f".{name}.{os.getpid()}.download")
+    try:
+        with urlopen(f"{RELEASE_BASE}/{name}", timeout=60) as response:
+            with temporary.open("wb") as output:
+                shutil.copyfileobj(response, output)
+        actual = hashlib.sha256(temporary.read_bytes()).hexdigest()
+        if actual != expected:
+            raise RuntimeError(f"checksum mismatch for downloaded {name}")
+        temporary.chmod(0o700 if executable else 0o600)
+        temporary.replace(destination)
+    except (OSError, URLError) as error:
+        raise RuntimeError(f"could not download {name}: {error}")
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+def local_program(name, explicit=None):
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise RuntimeError(f"{name} not found: {path}")
+        return path
+    adjacent = HERE / name
+    if adjacent.is_file() and os.access(adjacent, os.X_OK):
+        return adjacent
+    installed = shutil.which(name)
+    if installed:
+        return Path(installed).resolve()
+    print(f"Downloading {name} from {RELEASE_REPOSITORY}...", flush=True)
+    return release_asset(name, executable=True)
+
+REMOTE_DIR = r'''
+set -eu
+if [ -n "${GMUX_SOCKET_DIR:-}" ]; then
+    directory=$GMUX_SOCKET_DIR
+elif [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    directory=$XDG_RUNTIME_DIR/gmux
+else
+    directory=/tmp/gmux-$(id -u)
+fi
+umask 077
+mkdir -p "$directory"
+chmod 700 "$directory"
+[ -d "$directory" ] && [ ! -L "$directory" ]
+[ "$(stat -c %u "$directory")" = "$(id -u)" ]
+printf '%s\n' "$directory"
+'''
+
+def run_ssh(host, script, *args, check=True, capture=True, stdin=None):
+    remote = "sh -s -- " + " ".join(shlex.quote(arg) for arg in args)
+    command = ["ssh", host, remote]
+    return subprocess.run(command, input=stdin if stdin is not None else script,
+                          text=True, capture_output=capture, check=check)
+
+def remote_dir(host):
+    return run_ssh(host, REMOTE_DIR).stdout.strip()
+
+def remote_server(host):
+    script = r'''
+set -eu
+if command -v gmux-server >/dev/null 2>&1; then
+    candidate=$(command -v gmux-server)
+elif [ -x "$HOME/.local/bin/gmux-server" ]; then
+    candidate=$HOME/.local/bin/gmux-server
+else
+    exit 1
+fi
+"$candidate" 2>&1 | grep -q -- --check
+printf '%s\n' "$candidate"
+'''
+    result = run_ssh(host, script, check=False)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+def provision_terminfo(host):
+    source = HERE / "terminfo" / "xterm-kitty.terminfo"
+    if not source.is_file():
+        source = release_asset("xterm-kitty.terminfo")
+    directory_script = r'''
+set -eu
+if [ -n "${XDG_DATA_HOME:-}" ]; then
+    directory=$XDG_DATA_HOME/gmux/terminfo
+else
+    directory=$HOME/.local/share/gmux/terminfo
+fi
+umask 077
+mkdir -p "$directory"
+chmod 700 "$directory"
+printf '%s\n' "$directory"
+'''
+    directory = run_ssh(host, directory_script).stdout.strip()
+    has_tic = run_ssh(host, "command -v tic >/dev/null 2>&1",
+                      check=False).returncode == 0
+    if has_tic:
+        command = (f"umask 077; tic -x -o {shlex.quote(directory)} "
+                   "/dev/stdin")
+        subprocess.run(["ssh", host, command], input=source.read_text(),
+                       text=True, check=True)
+    else:
+        with tempfile.TemporaryDirectory(prefix="gmux-terminfo-") as temp:
+            subprocess.run(["tic", "-x", "-o", temp, str(source)],
+                           check=True)
+            entries = list(Path(temp).glob("*/xterm-kitty"))
+            if len(entries) != 1:
+                raise RuntimeError("local tic did not create xterm-kitty")
+            remote_entry = f"{directory}/{entries[0].parent.name}/xterm-kitty"
+            command = (f"umask 077; mkdir -p "
+                       f"{shlex.quote(str(Path(remote_entry).parent))}; "
+                       f"cat > {shlex.quote(remote_entry)}; "
+                       f"chmod 600 {shlex.quote(remote_entry)}")
+            subprocess.run(["ssh", host, command],
+                           input=entries[0].read_bytes(), check=True)
+    verify = 'test -r "$1/x/xterm-kitty" -o -r "$1/78/xterm-kitty"\n'
+    run_ssh(host, verify, directory)
+
+def copy_server(host, local_binary, destination="~/.local/bin"):
+    binary = Path(local_binary).expanduser().resolve()
+    if not binary.is_file():
+        raise RuntimeError(f"server binary not found: {binary}")
+    script = r'''
+set -eu
+destination=$1
+case "$destination" in
+    '~') destination=$HOME ;;
+    '~/'*) destination=$HOME/${destination#\~/} ;;
+esac
+umask 077
+mkdir -p "$destination"
+chmod 700 "$destination"
+printf '%s\n' "$destination"
+'''
+    resolved = run_ssh(host, script, destination).stdout.strip()
+    subprocess.run(["scp", str(binary), f"{host}:{resolved}/gmux-server"],
+                   check=True)
+    run_ssh(host, 'chmod 700 "$1/gmux-server"\n', resolved)
+    provision_terminfo(host)
+
+def sessions(host, server, directory):
+    script = r'''
+set -eu
+server=$1
+directory=$2
+for path in "$directory"/*.sock; do
+    [ -S "$path" ] || continue
+    [ "$(stat -c %u "$path")" = "$(id -u)" ] || continue
+    name=${path##*/}
+    name=${name%.sock}
+    set +e
+    "$server" --check "$path" >/dev/null 2>&1
+    status=$?
+    set -e
+    if [ "$status" -eq 0 ] || [ "$status" -eq 2 ]; then
+        printf 'live\t%s\n' "$name"
+    else
+        printf 'stale\t%s\n' "$name"
+    fi
+done
+'''
+    result = run_ssh(host, script, server, directory)
+    return [tuple(line.split("\t", 1)) for line in result.stdout.splitlines()
+            if "\t" in line]
+
+def create_session(host, server, directory, name):
+    if not SESSION_RE.fullmatch(name):
+        raise RuntimeError("names may contain only letters, numbers, . _ and -")
+    script = r'''
+set -eu
+server=$1
+path=$2/$3.sock
+[ ! -e "$path" ]
+GMUX_TERMINFO=${XDG_DATA_HOME:-$HOME/.local/share}/gmux/terminfo \
+    "$server" "$path"
+'''
+    run_ssh(host, script, server, directory, name)
+
+def delete_session(host, server, directory, name):
+    if not SESSION_RE.fullmatch(name):
+        raise RuntimeError("invalid session name")
+    script = r'''
+set -eu
+server=$1
+path=$2/$3.sock
+[ -S "$path" ] || exit 0
+[ "$(stat -c %u "$path")" = "$(id -u)" ]
+set +e
+"$server" --check "$path" >/dev/null 2>&1
+status=$?
+set -e
+if [ "$status" -eq 0 ] || [ "$status" -eq 2 ]; then
+    "$server" --kill "$path"
+else
+    rm -- "$path"
+fi
+'''
+    run_ssh(host, script, server, directory, name)
+
+def local_dir():
+    configured = os.environ.get("GMUX_SOCKET_DIR")
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    path = Path(configured or (Path(runtime) / "gmux" if runtime
+                               else f"/tmp/gmux-{os.getuid()}"))
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.lstat()
+    if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid() or info.st_mode & 0o077):
+        raise RuntimeError(f"insecure local socket directory: {path}")
+    return path
+
+def attach(host, directory, name, client):
+    if not SESSION_RE.fullmatch(name):
+        raise RuntimeError("invalid session name")
+    local = local_dir() / f"{host.replace('/', '_')}-{name}.sock"
+    remote = f"{directory}/{name}.sock"
+    if local.exists() or local.is_socket():
+        info = local.lstat()
+        if info.st_uid != os.getuid() or not stat.S_ISSOCK(info.st_mode):
+            raise RuntimeError(f"refusing to replace {local}")
+        probe = socket.socket(socket.AF_UNIX)
+        try:
+            probe.connect(str(local))
+        except ConnectionRefusedError:
+            pass
+        else:
+            raise RuntimeError(f"local forward is already active: {local}")
+        finally:
+            probe.close()
+        local.unlink()
+    forward = subprocess.Popen([
+        "ssh", "-N", "-o", "ExitOnForwardFailure=yes",
+        "-o", "StreamLocalBindMask=0177",
+        "-o", "StreamLocalBindUnlink=yes",
+        "-L", f"{local}:{remote}", host,
+    ])
+    forward_inode = None
+    try:
+        for _ in range(100):
+            if local.is_socket():
+                break
+            if forward.poll() is not None:
+                raise RuntimeError("SSH forwarding exited before it was ready")
+            time.sleep(0.05)
+        else:
+            raise RuntimeError("timed out waiting for SSH forwarding")
+        forward_inode = local.lstat().st_ino
+        subprocess.run([client, "--connect", str(local)], check=False)
+    finally:
+        forward.terminate()
+        try:
+            forward.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            forward.kill()
+        if local.is_socket():
+            info = local.lstat()
+            if info.st_uid == os.getuid() and info.st_ino == forward_inode:
+                local.unlink()
+
+def prompt(stdscr, label):
+    curses.echo()
+    height, _ = stdscr.getmaxyx()
+    stdscr.move(height - 1, 0)
+    stdscr.clrtoeol()
+    stdscr.addstr(height - 1, 0, label)
+    value = stdscr.getstr().decode(errors="replace").strip()
+    curses.noecho()
+    return value
+
+def tui(stdscr, host, server, directory, client):
+    curses.curs_set(0)
+    selected, message = 0, ""
+    while True:
+        try:
+            entries = sessions(host, server, directory)
+        except Exception as error:
+            entries, message = [], str(error)
+        selected = min(selected, max(0, len(entries) - 1))
+        stdscr.erase()
+        stdscr.addstr(0, 0, f"gmux sessions on {host}  ({directory})")
+        stdscr.addstr(1, 0, "j/k move  Enter attach  n new  d delete  r refresh  q quit")
+        for index, (status, name) in enumerate(entries):
+            marker = ">" if index == selected else " "
+            stdscr.addstr(index + 3, 0, f"{marker} {name} [{status}]")
+        if message:
+            stdscr.addstr(max(4, len(entries) + 4), 0, message)
+        stdscr.refresh()
+        key = stdscr.getch()
+        message = ""
+        if key in (ord("q"), 27):
+            return
+        if key in (ord("j"), curses.KEY_DOWN) and entries:
+            selected = min(selected + 1, len(entries) - 1)
+        elif key in (ord("k"), curses.KEY_UP) and entries:
+            selected = max(selected - 1, 0)
+        elif key in (10, 13, curses.KEY_ENTER) and entries:
+            status, name = entries[selected]
+            if status == "stale":
+                message = "That socket is stale; delete it with d first."
+            else:
+                curses.endwin()
+                try:
+                    attach(host, directory, name, client)
+                except Exception as error:
+                    message = str(error)
+                stdscr.refresh()
+        elif key == ord("n"):
+            name = prompt(stdscr, "new session name: ")
+            try:
+                create_session(host, server, directory, name)
+            except Exception as error:
+                message = str(error)
+        elif key == ord("d") and entries:
+            _, name = entries[selected]
+            answer = prompt(stdscr, f"delete {name}? [y/N] ")
+            if answer.lower() == "y":
+                try:
+                    delete_session(host, server, directory, name)
+                except Exception as error:
+                    message = str(error)
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("host", help="SSH host or alias")
+    parser.add_argument("--client", help="local gmux binary override")
+    parser.add_argument("--server-binary",
+                        help="local gmux-server binary override")
+    args = parser.parse_args()
+    client = local_program("gmux", args.client)
+    server = remote_server(args.host)
+    if not server:
+        answer = input("gmux-server is missing remotely. Copy it? [y/N] ")
+        if answer.lower() != "y":
+            return 1
+        destination = input("remote directory [~/.local/bin]: ").strip()
+        server_binary = local_program("gmux-server", args.server_binary)
+        copy_server(args.host, server_binary,
+                    destination or "~/.local/bin")
+        server = remote_server(args.host)
+        if not server:
+            raise RuntimeError("copied gmux-server was not found remotely")
+    provision_terminfo(args.host)
+    directory = remote_dir(args.host)
+    curses.wrapper(tui, args.host, server, directory, str(client))
+    return 0
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f"gmuxctl: {error}", file=sys.stderr)
+        raise SystemExit(1)

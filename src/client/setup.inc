@@ -53,6 +53,11 @@ typedef struct {
     GhosttyClipboardLocation pending_clipboard_location;
     bool keys[256];
     guint socket_source;
+    double scroll_y, momentum_velocity;
+    gint64 momentum_last_us;
+    guint momentum_tick;
+    uint32_t next_scroll_serial, inflight_scroll_serial;
+    int inflight_scroll_rows;
 } GtkClient;
 
 static bool gtk_client_send(GtkClient *client, InputKind kind,

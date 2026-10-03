@@ -16,7 +16,8 @@ static bool apply_input_wire(InputWire *wire, int pty_fd,
                              GhosttyKeyEvent key_event,
                              GhosttyMouseEncoder mouse_encoder,
                              GhosttyMouseEvent mouse_event,
-                             InputResize *size, bool *attached)
+                             InputResize *size, bool *attached,
+                             bool *ping_requested, uint32_t *scroll_serial)
 {
     bool terminal_changed = false;
     size_t offset = 0;
@@ -35,6 +36,8 @@ static bool apply_input_wire(InputWire *wire, int pty_fd,
             *attached = false;
         } else if (record.kind == INPUT_SHUTDOWN && record.size == 0) {
             server_stop = 1;
+        } else if (record.kind == INPUT_PING && record.size == 0) {
+            *ping_requested = true;
         } else if (record.kind == INPUT_RESIZE
                    && record.size == sizeof(InputResize)) {
             memcpy(size, payload, sizeof(*size));
@@ -52,9 +55,13 @@ static bool apply_input_wire(InputWire *wire, int pty_fd,
                    && record.size == sizeof(InputKey)) {
             InputKey message;
             memcpy(&message, payload, sizeof(message));
+            bool encoded = false;
             if (message.key == GHOSTTY_KEY_UNIDENTIFIED) {
-                if (message.text_len <= sizeof(message.text))
+                if (message.text_len > 0
+                    && message.text_len <= sizeof(message.text)) {
                     pty_write(pty_fd, message.text, message.text_len);
+                    encoded = true;
+                }
             } else {
                 ghostty_key_encoder_setopt_from_terminal(key_encoder, terminal);
                 ghostty_key_event_set_key(key_event, message.key);
@@ -69,8 +76,22 @@ static bool apply_input_wire(InputWire *wire, int pty_fd,
                 char buf[128];
                 size_t written = 0;
                 if (ghostty_key_encoder_encode(key_encoder, key_event,
-                        buf, sizeof(buf), &written) == GHOSTTY_SUCCESS)
+                        buf, sizeof(buf), &written) == GHOSTTY_SUCCESS
+                    && written > 0) {
                     pty_write(pty_fd, buf, written);
+                    encoded = true;
+                }
+            }
+            // Ghostty returns to the live screen only after a key event really
+            // encoded PTY bytes. Client-only bindings such as copy never arrive
+            // here, so copying from scrollback leaves the viewport untouched.
+            if (encoded && message.action != GHOSTTY_KEY_ACTION_RELEASE) {
+                GhosttyTerminalScrollViewport bottom = {
+                    .tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM,
+                };
+                ghostty_terminal_scroll_viewport(terminal, bottom);
+                *scroll_serial = 0;
+                terminal_changed = true;
             }
         } else if (record.kind == INPUT_MOUSE
                    && record.size == sizeof(InputMouse)) {
@@ -80,12 +101,37 @@ static bool apply_input_wire(InputWire *wire, int pty_fd,
             ghostty_terminal_get(terminal,
                 GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING, &mouse_tracking);
             if (message.wheel && !mouse_tracking) {
-                GhosttyTerminalScrollViewport scroll = {
-                    .tag = GHOSTTY_SCROLL_VIEWPORT_DELTA,
-                    .value = { .delta = message.wheel > 0 ? -3 : 3 },
+                GhosttyTerminalScreen screen = GHOSTTY_TERMINAL_SCREEN_PRIMARY;
+                GhosttyTerminalModeConfig alt_scroll = {
+                    .mode = GHOSTTY_MODE_ALT_SCROLL,
                 };
-                ghostty_terminal_scroll_viewport(terminal, scroll);
-                terminal_changed = true;
+                ghostty_terminal_get(terminal,
+                    GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen);
+                ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MODE,
+                                     &alt_scroll);
+                if (screen == GHOSTTY_TERMINAL_SCREEN_ALTERNATE
+                    && alt_scroll.value) {
+                    GhosttyTerminalModeConfig cursor_keys = {
+                        .mode = GHOSTTY_MODE_DECCKM,
+                    };
+                    ghostty_terminal_get(terminal,
+                        GHOSTTY_TERMINAL_DATA_MODE, &cursor_keys);
+                    const char *sequence = message.wheel > 0
+                        ? (cursor_keys.value ? "\x1bOA" : "\x1b[A")
+                        : (cursor_keys.value ? "\x1bOB" : "\x1b[B");
+                    int count = message.wheel > 0
+                        ? message.wheel : -(int)message.wheel;
+                    for (int i = 0; i < count; i++)
+                        pty_write(pty_fd, sequence, 3);
+                } else {
+                    GhosttyTerminalScrollViewport scroll = {
+                        .tag = GHOSTTY_SCROLL_VIEWPORT_DELTA,
+                        .value = { .delta = -message.wheel },
+                    };
+                    ghostty_terminal_scroll_viewport(terminal, scroll);
+                    *scroll_serial = message.scroll_serial;
+                    terminal_changed = true;
+                }
             } else {
                 ghostty_mouse_encoder_setopt_from_terminal(
                     mouse_encoder, terminal);

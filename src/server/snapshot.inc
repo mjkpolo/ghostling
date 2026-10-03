@@ -79,11 +79,12 @@ static void serialize_render_snapshot(
     const GhosttyTerminalScrollbar *scrollbar,
     GhosttyTerminal terminal,
     GhosttyKittyGraphicsPlacementIterator placement_iter,
-    const ServerTheme *theme)
+    const ServerTheme *theme, uint32_t scroll_serial)
 {
     GhosttyRenderStateColors colors =
         GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
-    if (ghostty_render_state_colors_get(render_state, &colors) != GHOSTTY_SUCCESS)
+    if (ghostty_render_state_get(render_state,
+            GHOSTTY_RENDER_STATE_DATA_COLORS, &colors) != GHOSTTY_SUCCESS)
         return;
 
     SnapshotHeader header = {
@@ -105,6 +106,20 @@ static void serialize_render_snapshot(
         GHOSTTY_RENDER_STATE_DATA_COLS, &header.cols);
     ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING,
                          &header.mouse_tracking);
+    GhosttyTerminalScreen screen = GHOSTTY_TERMINAL_SCREEN_PRIMARY;
+    ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN,
+                         &screen);
+    ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_VIEWPORT_ACTIVE,
+                         &header.viewport_active);
+    header.viewport_scrollable =
+        screen == GHOSTTY_TERMINAL_SCREEN_PRIMARY && !header.mouse_tracking;
+    header.scroll_serial = scroll_serial;
+    GhosttyRenderStateOverscan overscan = {0};
+    if (ghostty_render_state_get(render_state,
+            GHOSTTY_RENDER_STATE_DATA_OVERSCAN, &overscan) == GHOSTTY_SUCCESS) {
+        header.overscan_above = overscan.above;
+        header.overscan_below = overscan.below;
+    }
 
     bool cursor_in_viewport = false;
     ghostty_render_state_get(render_state,
@@ -140,19 +155,16 @@ static void serialize_render_snapshot(
         return;
 
     const bool send_all = dirty == GHOSTTY_RENDER_STATE_DIRTY_FULL;
-    uint16_t row_index = 0;
     while (ghostty_render_state_row_iterator_next(row_iter)) {
         bool row_dirty = false;
         ghostty_render_state_row_get(row_iter,
             GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY, &row_dirty);
         if (!send_all && !row_dirty) {
-            row_index++;
             continue;
         }
 
         if (ghostty_render_state_row_get(row_iter,
                 GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &cells) != GHOSTTY_SUCCESS) {
-            row_index++;
             continue;
         }
 
@@ -160,7 +172,11 @@ static void serialize_render_snapshot(
         // emitted so the client clears any cells that used to be present.
         const size_t record_offset = wire->len;
         SnapshotRecord record = { SNAPSHOT_ROW, sizeof(SnapshotRow) };
-        SnapshotRow row = { .row = row_index };
+        SnapshotRow row = {0};
+        if (ghostty_render_state_row_get(row_iter,
+                GHOSTTY_RENDER_STATE_ROW_DATA_VIEWPORT_Y,
+                &row.row) != GHOSTTY_SUCCESS)
+            continue;
         GhosttyRow raw_row = 0;
         if (ghostty_render_state_row_get(row_iter,
                 GHOSTTY_RENDER_STATE_ROW_DATA_RAW, &raw_row) == GHOSTTY_SUCCESS)
@@ -251,7 +267,6 @@ static void serialize_render_snapshot(
         bool clean = false;
         ghostty_render_state_row_set(row_iter,
             GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY, &clean);
-        row_index++;
     }
 
     if (has_kitty && placement_iter) {

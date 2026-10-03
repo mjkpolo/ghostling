@@ -30,7 +30,7 @@ if (GMUX_BUILD_SERVER)
       CACHE FILEPATH "Path to the Zig compiler" FORCE)
   FetchContent_Declare(ghostty
     GIT_REPOSITORY https://github.com/ghostty-org/ghostty.git
-    GIT_TAG f64f4aca2c29b554d111b36c3d946a9bddd159ff
+    GIT_TAG befcdfd2c3a1cb24d9ec886e93c95b2b5daa7028
   )
   FetchContent_MakeAvailable(ghostty)
 elseif (GMUX_BUILD_CLIENT)
@@ -91,7 +91,7 @@ target_include_directories(gmux PRIVATE
   "${CMAKE_BINARY_DIR}"
   "${ghostty_SOURCE_DIR}/include"
 )
-target_link_libraries(gmux PkgConfig::GTK4 PkgConfig::FONTCONFIG msgpack-c)
+target_link_libraries(gmux PkgConfig::GTK4 PkgConfig::FONTCONFIG msgpack-c m)
 endif()
 
 if (GMUX_BUILD_SERVER)
@@ -120,6 +120,7 @@ endif()
 
 if (GMUX_BUILD_CLIENT)
   install(TARGETS gmux RUNTIME DESTINATION bin)
+  install(PROGRAMS gmuxctl DESTINATION bin)
 endif()
 if (GMUX_BUILD_SERVER)
   install(TARGETS gmux-server RUNTIME DESTINATION bin)
@@ -127,4 +128,6 @@ if (GMUX_BUILD_SERVER)
           DESTINATION share/gmux/themes)
   install(FILES vendor/iterm2-color-schemes/LICENSE
           DESTINATION share/gmux/themes)
+  install(FILES terminfo/xterm-kitty.terminfo terminfo/KITTY-LICENSE
+          DESTINATION share/gmux/terminfo)
 endif()

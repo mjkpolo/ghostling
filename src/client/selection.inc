@@ -8,7 +8,8 @@ static void gtk_selection_position(GtkClient *client, double x, double y,
         *row = *col = 0;
         return;
     }
-    int r = ((int)y - client->pad) / client->cell_height;
+    int r = (int)((y - client->pad - client->scroll_y)
+                  / client->cell_height);
     int c = ((int)x - client->pad) / client->cell_width;
     if (r < 0) r = 0;
     if (c < 0) c = 0;
@@ -37,8 +38,8 @@ static bool gtk_word_boundary(const SnapshotCell *cell)
 static bool gtk_word_at(GtkClient *client, uint16_t row, uint16_t col,
                         uint16_t *first, uint16_t *last)
 {
-    if (row >= client->render.row_count) return false;
-    const CachedRow *cached = &client->render.rows[row];
+    const CachedRow *cached = render_client_row_const(&client->render, row);
+    if (!cached) return false;
     const SnapshotCell *cell = cached_cell(cached, col);
     if (!cell || !cell->has_text) return false;
     bool boundary = gtk_word_boundary(cell);
@@ -61,8 +62,8 @@ static bool gtk_word_at(GtkClient *client, uint16_t row, uint16_t col,
 static bool gtk_line_at(GtkClient *client, uint16_t row,
                         uint16_t *first, uint16_t *last)
 {
-    if (row >= client->render.row_count) return false;
-    const CachedRow *cached = &client->render.rows[row];
+    const CachedRow *cached = render_client_row_const(&client->render, row);
+    if (!cached) return false;
     *first = client->render.header.cols;
     *last = 0;
     for (uint16_t col = 0; col < client->render.header.cols; col++) {
@@ -132,8 +133,8 @@ static void gtk_copy_selection(GtkClient *client)
         uint16_t last = row == end_row
             ? end_col : client->render.header.cols - 1;
         gsize line_start = text->len;
-        if (row < client->render.row_count) {
-            const CachedRow *cached = &client->render.rows[row];
+        const CachedRow *cached = render_client_row_const(&client->render, row);
+        if (cached) {
             for (uint16_t col = first; col <= last; col++) {
                 const SnapshotCell *cell = cached_cell(cached, col);
                 if (cell && cell->wide != GHOSTTY_CELL_WIDE_SPACER_TAIL
@@ -150,8 +151,7 @@ static void gtk_copy_selection(GtkClient *client)
                && text->str[text->len - 1] == ' ')
             g_string_truncate(text, text->len - 1);
         if (row != end_row
-            && (row >= client->render.row_count
-                || !client->render.rows[row].wrapped))
+            && (!cached || !cached->wrapped))
             g_string_append_c(text, '\n');
     }
     gdk_clipboard_set_text(gtk_widget_get_clipboard(client->area), text->str);
@@ -194,7 +194,8 @@ static bool snapshot_updates_selection(const RenderSnapshotWire *wire,
             && record.size >= sizeof(SnapshotRow)) {
             SnapshotRow row;
             memcpy(&row, wire->data + offset, sizeof(row));
-            if (row.row >= start_row && row.row <= end_row) return true;
+            if (row.row >= 0 && row.row >= start_row
+                && row.row <= end_row) return true;
         }
         offset += record.size;
     }

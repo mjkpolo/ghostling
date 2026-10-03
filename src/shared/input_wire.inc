@@ -13,6 +13,7 @@ typedef enum {
     INPUT_FOCUS,
     INPUT_SHUTDOWN,
     INPUT_PASTE,
+    INPUT_PING,
 } InputKind;
 
 typedef struct { uint32_t kind, size; } InputRecord;
@@ -40,6 +41,7 @@ typedef struct {
     float x, y;
     int8_t wheel;
     bool has_button, any_button_pressed;
+    uint32_t scroll_serial;
 } InputMouse;
 
 typedef struct { bool focused; } InputFocus;
@@ -98,6 +100,36 @@ static int unix_socket(const char *path, bool server)
         return -1;
     }
     memcpy(address.sun_path, path, strlen(path) + 1);
+
+    if (!server) {
+        struct stat socket_stat;
+        if (lstat(path, &socket_stat) < 0) return -1;
+        if (!S_ISSOCK(socket_stat.st_mode)
+            || socket_stat.st_uid != getuid()
+            || (socket_stat.st_mode & 0077) != 0) {
+            errno = EACCES;
+            return -1;
+        }
+    } else {
+        char parent[PATH_MAX];
+        if (strlen(path) >= sizeof(parent)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        strcpy(parent, path);
+        char *slash = strrchr(parent, '/');
+        if (!slash) strcpy(parent, ".");
+        else if (slash == parent) slash[1] = '\0';
+        else *slash = '\0';
+        struct stat parent_stat;
+        if (lstat(parent, &parent_stat) < 0) return -1;
+        if (!S_ISDIR(parent_stat.st_mode)
+            || parent_stat.st_uid != getuid()
+            || (parent_stat.st_mode & 0022) != 0) {
+            errno = EACCES;
+            return -1;
+        }
+    }
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -302,7 +334,7 @@ static bool object_bool(msgpack_object object, bool *value)
     return true;
 }
 
-#ifdef GMUX_CLIENT
+#if defined(GMUX_CLIENT) || defined(GMUX_SERVER)
 static size_t input_record_count(const InputWire *wire)
 {
     size_t count = 0, offset = 0;
@@ -330,7 +362,7 @@ static bool input_pack(const InputWire *wire, msgpack_sbuffer *buffer)
         if (offset + record.size > wire->len) return false;
         const uint8_t *payload = wire->data + offset;
         if (record.kind == INPUT_ATTACH || record.kind == INPUT_DETACH
-            || record.kind == INPUT_SHUTDOWN) {
+            || record.kind == INPUT_SHUTDOWN || record.kind == INPUT_PING) {
             msgpack_pack_array(&packer, 1);
             msgpack_pack_uint32(&packer, record.kind);
         } else if (record.kind == INPUT_RESIZE
@@ -364,7 +396,7 @@ static bool input_pack(const InputWire *wire, msgpack_sbuffer *buffer)
                    && record.size == sizeof(InputMouse)) {
             InputMouse value;
             memcpy(&value, payload, sizeof(value));
-            msgpack_pack_array(&packer, 9);
+            msgpack_pack_array(&packer, 10);
             msgpack_pack_uint32(&packer, record.kind);
             msgpack_pack_uint32(&packer, value.action);
             msgpack_pack_uint32(&packer, value.button);
@@ -376,6 +408,7 @@ static bool input_pack(const InputWire *wire, msgpack_sbuffer *buffer)
                              : msgpack_pack_false(&packer);
             value.any_button_pressed ? msgpack_pack_true(&packer)
                                      : msgpack_pack_false(&packer);
+            msgpack_pack_uint32(&packer, value.scroll_serial);
         } else if (record.kind == INPUT_FOCUS
                    && record.size == sizeof(InputFocus)) {
             InputFocus value;
@@ -419,7 +452,7 @@ static bool input_unpack(const void *data, size_t len, InputWire *wire)
         uint64_t kind;
         if (!object_u64(field[0], &kind)) goto fail;
         if ((kind == INPUT_ATTACH || kind == INPUT_DETACH
-             || kind == INPUT_SHUTDOWN)
+             || kind == INPUT_SHUTDOWN || kind == INPUT_PING)
             && message.via.array.size == 1) {
             if (!input_append(wire, (InputKind)kind, NULL, 0)) goto fail;
         } else if (kind == INPUT_RESIZE && message.via.array.size == 8) {
@@ -452,7 +485,9 @@ static bool input_unpack(const void *data, size_t len, InputWire *wire)
             };
             memcpy(key.text, field[6].via.bin.ptr, key.text_len);
             if (!input_append(wire, INPUT_KEY, &key, sizeof(key))) goto fail;
-        } else if (kind == INPUT_MOUSE && message.via.array.size == 9) {
+        } else if (kind == INPUT_MOUSE
+                   && (message.via.array.size == 9
+                       || message.via.array.size == 10)) {
             uint64_t action, button, mods;
             int64_t wheel;
             double x, y;
@@ -471,6 +506,12 @@ static bool input_unpack(const void *data, size_t len, InputWire *wire)
             mouse.x = (float)x;
             mouse.y = (float)y;
             mouse.wheel = (int8_t)wheel;
+            if (message.via.array.size == 10) {
+                uint64_t serial;
+                if (!object_u64(field[9], &serial)
+                    || serial > UINT32_MAX) goto fail;
+                mouse.scroll_serial = (uint32_t)serial;
+            }
             if (!input_append(wire, INPUT_MOUSE, &mouse, sizeof(mouse)))
                 goto fail;
         } else if (kind == INPUT_FOCUS && message.via.array.size == 2) {

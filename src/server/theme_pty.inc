@@ -177,6 +177,32 @@ static void server_theme_apply(GhosttyTerminal terminal,
             GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, theme->palette);
 }
 
+static bool server_terminfo_dir(char *out, size_t size)
+{
+    const char *configured = getenv("GMUX_TERMINFO");
+    if (configured && *configured
+        && snprintf(out, size, "%s", configured) < (int)size)
+        return true;
+    const char *xdg = getenv("XDG_DATA_HOME");
+    if (xdg && *xdg
+        && snprintf(out, size, "%s/gmux/terminfo", xdg) < (int)size)
+        return true;
+    const char *home = getenv("HOME");
+    return home && *home
+        && snprintf(out, size, "%s/.local/share/gmux/terminfo", home)
+            < (int)size;
+}
+
+static bool server_has_kitty_terminfo(char *directory, size_t size)
+{
+    if (!server_terminfo_dir(directory, size)) return false;
+    char entry[PATH_MAX];
+    return (snprintf(entry, sizeof(entry), "%s/x/xterm-kitty", directory)
+                < (int)sizeof(entry) && access(entry, R_OK) == 0)
+        || (snprintf(entry, sizeof(entry), "%s/78/xterm-kitty", directory)
+                < (int)sizeof(entry) && access(entry, R_OK) == 0);
+}
+
 // Spawn the user's default shell in a new pseudo-terminal.
 //
 // Creates a pty pair via forkpty(), sets the initial window size, execs the
@@ -227,7 +253,13 @@ static int pty_spawn(pid_t *child_out, uint16_t cols, uint16_t rows,
 
         // Child process — replace ourselves with the shell.
         // TERM tells programs what escape sequences we understand.
-        setenv("TERM", "xterm-256color", 1);
+        char terminfo[PATH_MAX];
+        if (server_has_kitty_terminfo(terminfo, sizeof(terminfo))) {
+            setenv("TERM", "xterm-kitty", 1);
+            setenv("TERMINFO", terminfo, 1);
+        } else {
+            setenv("TERM", "xterm-256color", 1);
+        }
         execl(shell, shell_name, NULL);
         _exit(127); // execl only returns on error
     }

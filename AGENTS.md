@@ -44,6 +44,11 @@
 - The current prototype has separate `gmux` GUI and persistent `gmux-server`
   binaries communicating over a Unix socket. SSH Unix-socket forwarding is the
   proposed remote transport; pane-layout details are undecided.
+- `gmuxctl` is the dependency-free Python/curses session manager. It discovers
+  remote sockets, distinguishes live and stale sessions with `gmux-server
+  --check`, creates and deletes sessions, provisions the bundled `xterm-kitty`
+  terminfo, and owns per-attachment SSH Unix-socket forwarding. Socket
+  directories must be user-owned mode `0700`; sockets must be mode `0600`.
 - Keep new tools, dependencies, and caches inside `~/codex_projects`. Zig 0.16.0
   is installed at `../zig-0.16.0/zig`; use it rather than the older Zig on PATH.
   Set `ZIG_GLOBAL_CACHE_DIR=/home/ma148697/codex_projects/.cache/zig` and

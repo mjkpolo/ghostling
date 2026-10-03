@@ -27,7 +27,7 @@ static void gtk_draw(GtkDrawingArea *area, cairo_t *cr,
                           client->regular, client->italic,
                           client->bold, client->bold_italic,
                           client->cell_width, client->cell_height,
-                          client->pad, width, height);
+                          client->pad, width, height, client->scroll_y);
     (void)area;
 }
 
@@ -47,10 +47,28 @@ static gboolean gtk_socket_ready(gint fd, GIOCondition condition,
             || !snapshot_decode(packed, packed_len, &client->snapshot)) {
             connected = false;
         } else {
+            const SnapshotHeader *header = snapshot_header(&client->snapshot);
+            if (header && client->inflight_scroll_rows
+                && header->scroll_serial
+                    == client->inflight_scroll_serial) {
+                client->scroll_y -=
+                    client->inflight_scroll_rows * client->cell_height;
+                client->inflight_scroll_rows = 0;
+                client->inflight_scroll_serial = 0;
+            }
+            if (header && (!header->viewport_scrollable
+                           || (header->viewport_active
+                               && header->scroll_serial == 0))) {
+                client->scroll_y = 0;
+                client->inflight_scroll_rows = 0;
+                client->inflight_scroll_serial = 0;
+                client->momentum_velocity = 0;
+            }
             if (snapshot_updates_selection(&client->snapshot,
                                            &client->selection))
                 gtk_clear_selection(client);
             render_client_apply(&client->render, &client->snapshot);
+            gtk_scroll_send_rows(client);
             apply_snapshot_title(client->window, &client->snapshot);
             apply_snapshot_clipboard(client, &client->snapshot);
             gtk_widget_queue_draw(client->area);
@@ -104,8 +122,11 @@ static void gtk_activate(GtkApplication *application, gpointer userdata)
     gtk_widget_add_controller(client->area, motion);
 
     GtkEventController *scroll = gtk_event_controller_scroll_new(
-        GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
+        GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES
+            | GTK_EVENT_CONTROLLER_SCROLL_KINETIC);
     g_signal_connect(scroll, "scroll", G_CALLBACK(gtk_mouse_scroll), client);
+    g_signal_connect(scroll, "decelerate",
+                     G_CALLBACK(gtk_mouse_decelerate), client);
     gtk_widget_add_controller(client->area, scroll);
 
     g_signal_connect(client->area, "notify::has-focus",
@@ -152,6 +173,7 @@ static int run_client(int socket_fd)
     int result = g_application_run(G_APPLICATION(client.application), 0, NULL);
 
     if (client.socket_source) g_source_remove(client.socket_source);
+    if (client.momentum_tick) g_source_remove(client.momentum_tick);
     render_client_free(&client.render);
     free(client.input.data);
     free(client.snapshot.data);

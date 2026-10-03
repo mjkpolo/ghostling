@@ -1,5 +1,12 @@
 name: Build Rocky Linux 9.4 binaries
 
+permissions:
+  contents: write
+
+concurrency:
+  group: rocky-release-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: [gmux-codex]
@@ -34,3 +41,21 @@ jobs:
           name: gmux-rocky-linux-9.4-x86_64
           path: artifacts/
           if-no-files-found: error
+      - name: Publish release
+        if: success() && github.event_name == 'push'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: gmux-codex-${{ github.run_number }}
+          name: gmux-codex build ${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          generate_release_notes: true
+          files: |
+            artifacts/gmux
+            artifacts/gmux-server
+            artifacts/gmuxctl
+            artifacts/gmux-themes.tar.gz
+            artifacts/xterm-kitty.terminfo
+            artifacts/KITTY-LICENSE
+            artifacts/SHA256SUMS
+            artifacts/dependencies.txt

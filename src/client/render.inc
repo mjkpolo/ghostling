@@ -18,11 +18,37 @@ static bool render_client_resize(RenderClientState *client, uint16_t rows)
     return true;
 }
 
+static CachedRow *render_client_row(RenderClientState *client,
+                                    int32_t viewport_y)
+{
+    int32_t index = viewport_y + client->overscan_above;
+    return index >= 0 && index < client->row_count
+        ? &client->rows[index] : NULL;
+}
+
+static const CachedRow *render_client_row_const(const RenderClientState *client,
+                                                int32_t viewport_y)
+{
+    int32_t index = viewport_y + client->overscan_above;
+    return index >= 0 && index < client->row_count
+        ? &client->rows[index] : NULL;
+}
+
 static void render_client_apply(RenderClientState *client,
                                 const RenderSnapshotWire *wire)
 {
     const SnapshotHeader *header = snapshot_header(wire);
-    if (!header || !render_client_resize(client, header->rows))
+    if (!header) return;
+    uint32_t total = (uint32_t)header->rows
+        + header->overscan_above + header->overscan_below;
+    if (total > UINT16_MAX) return;
+    if ((client->overscan_above != header->overscan_above
+         || client->overscan_below != header->overscan_below)) {
+        render_client_resize(client, 0);
+        client->overscan_above = header->overscan_above;
+        client->overscan_below = header->overscan_below;
+    }
+    if (!render_client_resize(client, (uint16_t)total))
         return;
     client->header = *header;
 
@@ -38,8 +64,8 @@ static void render_client_apply(RenderClientState *client,
             memcpy(&row, wire->data + offset, sizeof(row));
             size_t expected = sizeof(row)
                 + (size_t)row.cell_count * sizeof(SnapshotCell);
-            if (row.row < client->row_count && expected == record.size) {
-                CachedRow *cached = &client->rows[row.row];
+            CachedRow *cached = render_client_row(client, row.row);
+            if (cached && expected == record.size) {
                 SnapshotCell *cells = realloc(cached->cells,
                     (size_t)row.cell_count * sizeof(*cells));
                 if (row.cell_count == 0 || cells) {
@@ -207,16 +233,17 @@ static void cairo_snapshot_cells(cairo_t *cr,
                                  PangoFontDescription *bold,
                                  PangoFontDescription *bold_italic,
                                  int cell_width, int cell_height,
-                                 int pad, bool text_pass)
+                                 int pad, double scroll_y, bool text_pass)
 {
-    for (uint16_t row = 0; row < client->row_count; row++) {
-        const CachedRow *cached = &client->rows[row];
+    for (uint16_t index = 0; index < client->row_count; index++) {
+        int32_t viewport_y = (int32_t)index - client->overscan_above;
+        const CachedRow *cached = &client->rows[index];
         if (!text_pass) {
             for (uint16_t i = 0; i < cached->cell_count; i++) {
                 const SnapshotCell *cell = &cached->cells[i];
                 if (!cell->has_background) continue;
                 double x = pad + cell->col * cell_width;
-                double y = pad + row * cell_height;
+                double y = pad + viewport_y * cell_height + scroll_y;
                 cairo_color(cr, cell->background, 1.0);
                 cairo_rectangle(cr, x, y, cell_width, cell_height);
                 cairo_fill(cr);
@@ -240,15 +267,16 @@ static void cairo_snapshot_cells(cairo_t *cr,
                    && cells_shape_together(&cached->cells[end - 1],
                                            &cached->cells[end])) {
                 if (client->header.has_selection_foreground
-                    && selection_contains_cell(selection, row,
+                    && viewport_y >= 0
+                    && selection_contains_cell(selection, viewport_y,
                                                cached->cells[end - 1].col)
-                        != selection_contains_cell(selection, row,
+                        != selection_contains_cell(selection, viewport_y,
                                                    cached->cells[end].col))
                     break;
                 // Keep the cursor cell isolated so moving the cursor through
                 // a ligature exposes the underlying terminal characters.
                 if (client->header.cursor_visible
-                    && client->header.cursor_row == row
+                    && client->header.cursor_row == viewport_y
                     && (cached->cells[end - 1].col
                             == client->header.cursor_col
                         || cached->cells[end].col
@@ -264,7 +292,7 @@ static void cairo_snapshot_cells(cairo_t *cr,
                 g_string_append(text, cached->cells[j].text);
 
             double x = pad + first->col * cell_width;
-            double y = pad + row * cell_height;
+            double y = pad + viewport_y * cell_height + scroll_y;
             double alpha = first->faint ? 0.5 : 1.0;
             PangoFontDescription *font = first->bold
                 ? (first->italic ? bold_italic : bold)
@@ -273,7 +301,8 @@ static void cairo_snapshot_cells(cairo_t *cr,
             pango_layout_set_text(layout, text->str, (int)text->len);
             SnapshotRgb foreground =
                 client->header.has_selection_foreground
-                && selection_contains_cell(selection, row, first->col)
+                && viewport_y >= 0
+                && selection_contains_cell(selection, viewport_y, first->col)
                 ? client->header.selection_foreground : first->foreground;
             cairo_color(cr, foreground, alpha);
             cairo_move_to(cr, x, y);
@@ -284,7 +313,9 @@ static void cairo_snapshot_cells(cairo_t *cr,
                 const SnapshotCell *cell = &cached->cells[j];
                 SnapshotCell selected = *cell;
                 if (client->header.has_selection_foreground
-                    && selection_contains_cell(selection, row, cell->col)) {
+                    && viewport_y >= 0
+                    && selection_contains_cell(selection, viewport_y,
+                                               cell->col)) {
                     selected.foreground =
                         client->header.selection_foreground;
                     selected.has_underline_color = false;
@@ -305,7 +336,8 @@ static void cairo_snapshot_cells(cairo_t *cr,
 static void cairo_snapshot_images(cairo_t *cr,
                                   const RenderSnapshotWire *wire,
                                   GhosttyKittyPlacementLayer layer,
-                                  int cell_width, int cell_height, int pad)
+                                  int cell_width, int cell_height, int pad,
+                                  double scroll_y)
 {
     size_t offset = 0;
     while (offset + sizeof(SnapshotRecord) <= wire->len) {
@@ -342,7 +374,8 @@ static void cairo_snapshot_images(cairo_t *cr,
                         argb, CAIRO_FORMAT_ARGB32, image.image_w,
                         image.image_h, stride);
                     double dx = pad + image.viewport_col * cell_width + image.x_offset;
-                    double dy = pad + image.viewport_row * cell_height + image.y_offset;
+                    double dy = pad + image.viewport_row * cell_height
+                        + image.y_offset + scroll_y;
                     double dw = image.grid_cols * cell_width;
                     double dh = image.grid_rows * cell_height;
                     cairo_save(cr);
@@ -388,7 +421,8 @@ static void selection_bounds(const ClientSelection *selection,
 
 static void cairo_selection(cairo_t *cr, const ClientSelection *selection,
                             const SnapshotHeader *header,
-                            int cell_width, int cell_height, int pad)
+                            int cell_width, int cell_height, int pad,
+                            double scroll_y)
 {
     if (!selection->active || !header->cols) return;
     uint16_t start_row, start_col, end_row, end_col;
@@ -401,7 +435,7 @@ static void cairo_selection(cairo_t *cr, const ClientSelection *selection,
         uint16_t first = row == start_row ? start_col : 0;
         uint16_t last = row == end_row ? end_col : header->cols - 1;
         cairo_rectangle(cr, pad + first * cell_width,
-                        pad + row * cell_height,
+                        pad + row * cell_height + scroll_y,
                         (last - first + 1) * cell_width, cell_height);
     }
     cairo_fill(cr);
@@ -416,33 +450,40 @@ static void cairo_render_snapshot(cairo_t *cr,
                                   PangoFontDescription *bold,
                                   PangoFontDescription *bold_italic,
                                   int cell_width, int cell_height,
-                                  int pad, int width, int height)
+                                  int pad, int width, int height,
+                                  double scroll_y)
 {
     const SnapshotHeader *header = &client->header;
     cairo_color(cr, header->background, 1.0);
     cairo_paint(cr);
     PangoLayout *layout = pango_cairo_create_layout(cr);
+    cairo_save(cr);
+    cairo_rectangle(cr, pad, pad, header->cols * cell_width,
+                    header->rows * cell_height);
+    cairo_clip(cr);
 
     cairo_snapshot_images(cr, wire, GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_BG,
-                          cell_width, cell_height, pad);
+                          cell_width, cell_height, pad, scroll_y);
     cairo_snapshot_cells(cr, client, selection, layout, regular, italic,
                          bold, bold_italic,
-                         cell_width, cell_height, pad, false);
-    cairo_selection(cr, selection, header, cell_width, cell_height, pad);
+                         cell_width, cell_height, pad, scroll_y, false);
+    cairo_selection(cr, selection, header, cell_width, cell_height, pad,
+                    scroll_y);
     cairo_snapshot_images(cr, wire, GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_TEXT,
-                          cell_width, cell_height, pad);
+                          cell_width, cell_height, pad, scroll_y);
     cairo_snapshot_cells(cr, client, selection, layout, regular, italic,
                          bold, bold_italic,
-                         cell_width, cell_height, pad, true);
+                         cell_width, cell_height, pad, scroll_y, true);
     if (header->cursor_visible) {
         cairo_color(cr, header->cursor_color, 0.5);
         cairo_rectangle(cr, pad + header->cursor_col * cell_width,
-                        pad + header->cursor_row * cell_height,
+                        pad + header->cursor_row * cell_height + scroll_y,
                         cell_width, cell_height);
         cairo_fill(cr);
     }
     cairo_snapshot_images(cr, wire, GHOSTTY_KITTY_PLACEMENT_LAYER_ABOVE_TEXT,
-                          cell_width, cell_height, pad);
+                          cell_width, cell_height, pad, scroll_y);
+    cairo_restore(cr);
 
     if (header->scrollbar_visible
         && header->scrollbar_total > header->scrollbar_len) {

@@ -7,6 +7,7 @@ typedef enum {
     SNAPSHOT_IMAGE = 3,
     SNAPSHOT_TITLE = 4,
     SNAPSHOT_CLIPBOARD = 5,
+    SNAPSHOT_PONG = 6,
 } SnapshotRecordKind;
 typedef struct { uint32_t kind, size; } SnapshotRecord;
 typedef struct { uint8_t r, g, b; } SnapshotRgb;
@@ -16,14 +17,18 @@ typedef struct {
     SnapshotRgb selection_background, selection_foreground;
     bool has_selection_background, has_selection_foreground;
     bool mouse_tracking;
+    bool viewport_scrollable;
+    bool viewport_active;
     bool cursor_visible;
     uint16_t cursor_col, cursor_row;
     SnapshotRgb cursor_color;
     bool scrollbar_visible;
     uint64_t scrollbar_total, scrollbar_len, scrollbar_offset;
+    uint32_t scroll_serial;
+    uint16_t overscan_above, overscan_below;
 } SnapshotHeader;
 typedef struct {
-    uint16_t row;
+    int32_t row;
     uint16_t cell_count;
     bool wrapped;
 } SnapshotRow;
@@ -47,6 +52,7 @@ typedef struct {
     SnapshotHeader header;
     CachedRow *rows;
     uint16_t row_count;
+    uint16_t overscan_above, overscan_below;
 } RenderClientState;
 typedef struct {
     bool active, dragging;
@@ -133,7 +139,7 @@ static bool snapshot_pack(const RenderSnapshotWire *wire,
             && record.size == sizeof(SnapshotHeader)) {
             SnapshotHeader header;
             memcpy(&header, payload, sizeof(header));
-            msgpack_pack_array(&packer, 17);
+            msgpack_pack_array(&packer, 22);
             msgpack_pack_uint32(&packer, record.kind);
             msgpack_pack_uint16(&packer, header.rows);
             msgpack_pack_uint16(&packer, header.cols);
@@ -156,6 +162,13 @@ static bool snapshot_pack(const RenderSnapshotWire *wire,
                 ? msgpack_pack_true(&packer) : msgpack_pack_false(&packer);
             header.has_selection_foreground
                 ? msgpack_pack_true(&packer) : msgpack_pack_false(&packer);
+            header.viewport_scrollable ? msgpack_pack_true(&packer)
+                                       : msgpack_pack_false(&packer);
+            header.viewport_active ? msgpack_pack_true(&packer)
+                                   : msgpack_pack_false(&packer);
+            msgpack_pack_uint32(&packer, header.scroll_serial);
+            msgpack_pack_uint16(&packer, header.overscan_above);
+            msgpack_pack_uint16(&packer, header.overscan_below);
         } else if (record.kind == SNAPSHOT_ROW
                    && record.size >= sizeof(SnapshotRow)) {
             SnapshotRow row;
@@ -165,7 +178,7 @@ static bool snapshot_pack(const RenderSnapshotWire *wire,
             if (expected != record.size) return false;
             msgpack_pack_array(&packer, 4);
             msgpack_pack_uint32(&packer, record.kind);
-            msgpack_pack_uint16(&packer, row.row);
+            msgpack_pack_int32(&packer, row.row);
             row.wrapped ? msgpack_pack_true(&packer)
                         : msgpack_pack_false(&packer);
             msgpack_pack_array(&packer, row.cell_count);
@@ -246,6 +259,9 @@ static bool snapshot_pack(const RenderSnapshotWire *wire,
             msgpack_pack_bin(&packer, clipboard.data_len);
             msgpack_pack_bin_body(&packer, payload + sizeof(clipboard),
                                   clipboard.data_len);
+        } else if (record.kind == SNAPSHOT_PONG && record.size == 0) {
+            msgpack_pack_array(&packer, 1);
+            msgpack_pack_uint32(&packer, record.kind);
         } else {
             return false;
         }
@@ -279,7 +295,8 @@ static bool snapshot_unpack(const void *data, size_t len,
         if (kind == SNAPSHOT_HEADER
             && (message.via.array.size == 12
                 || message.via.array.size == 13
-                || message.via.array.size == 17)) {
+                || message.via.array.size == 17
+                || message.via.array.size == 22)) {
             uint64_t rows, cols, cursor_col, cursor_row;
             SnapshotHeader header = {0};
             uint32_t base = message.via.array.size == 12 ? 0 : 1;
@@ -296,7 +313,7 @@ static bool snapshot_unpack(const void *data, size_t len,
                 || !object_u64(field[10 + base], &header.scrollbar_len)
                 || !object_u64(field[11 + base], &header.scrollbar_offset))
                 goto fail;
-            if (message.via.array.size == 17
+            if (message.via.array.size >= 17
                 && (!unpack_rgb(field[13], &header.selection_background)
                     || !unpack_rgb(field[14], &header.selection_foreground)
                     || !object_bool(field[15],
@@ -304,6 +321,20 @@ static bool snapshot_unpack(const void *data, size_t len,
                     || !object_bool(field[16],
                                     &header.has_selection_foreground)))
                 goto fail;
+            if (message.via.array.size == 22) {
+                uint64_t serial, above, below;
+                if (!object_bool(field[17], &header.viewport_scrollable)
+                    || !object_bool(field[18], &header.viewport_active)
+                    || !object_u64(field[19], &serial)
+                    || !object_u64(field[20], &above)
+                    || !object_u64(field[21], &below)
+                    || serial > UINT32_MAX || above > UINT16_MAX
+                    || below > UINT16_MAX)
+                    goto fail;
+                header.scroll_serial = (uint32_t)serial;
+                header.overscan_above = (uint16_t)above;
+                header.overscan_below = (uint16_t)below;
+            }
             header.rows = (uint16_t)rows;
             header.cols = (uint16_t)cols;
             header.cursor_col = (uint16_t)cursor_col;
@@ -314,12 +345,13 @@ static bool snapshot_unpack(const void *data, size_t len,
                    && (message.via.array.size == 3
                        || message.via.array.size == 4)) {
             uint32_t cells_index = message.via.array.size == 4 ? 3 : 2;
-            uint64_t row_index;
-            if (!object_u64(field[1], &row_index)
+            int64_t row_index;
+            if (!object_i64(field[1], &row_index)
+                || row_index < INT32_MIN || row_index > INT32_MAX
                 || field[cells_index].type != MSGPACK_OBJECT_ARRAY
                 || field[cells_index].via.array.size > UINT16_MAX) goto fail;
             SnapshotRow row = {
-                .row = (uint16_t)row_index,
+                .row = (int32_t)row_index,
                 .cell_count = (uint16_t)field[cells_index].via.array.size,
             };
             if (cells_index == 3 && !object_bool(field[2], &row.wrapped))
@@ -443,6 +475,8 @@ static bool snapshot_unpack(const void *data, size_t len,
                 || !snapshot_append(wire, &clipboard, sizeof(clipboard))
                 || !snapshot_append(wire, field[2].via.bin.ptr,
                                     clipboard.data_len)) goto fail;
+        } else if (kind == SNAPSHOT_PONG && message.via.array.size == 1) {
+            if (!snapshot_record(wire, SNAPSHOT_PONG, NULL, 0)) goto fail;
         } else {
             goto fail;
         }
@@ -456,7 +490,7 @@ fail:
 }
 #endif
 
-#ifdef GMUX_CLIENT
+#if defined(GMUX_CLIENT) || defined(GMUX_SERVER)
 static bool input_queue(WireConnection *connection, InputWire *outgoing)
 {
     msgpack_sbuffer packed;
