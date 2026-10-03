@@ -26,6 +26,19 @@ RELEASE_REPOSITORY = os.environ.get(
 RELEASE_BASE = os.environ.get(
     "GMUX_RELEASE_BASE",
     f"https://github.com/{RELEASE_REPOSITORY}/releases/latest/download")
+SSH_OPTIONS = []
+
+def ssh_command(*arguments):
+    """Ignore configured forwards for short-lived management commands."""
+    return ["ssh", *SSH_OPTIONS, *arguments]
+
+def ssh_forward_command(*arguments):
+    # ClearAllForwardings would also erase our explicit command-line -L.
+    options = [option
+               for pair in zip(SSH_OPTIONS[::2], SSH_OPTIONS[1::2])
+               if "ClearAllForwardings" not in pair[1]
+               for option in pair]
+    return ["ssh", *options, *arguments]
 
 def cache_dir():
     root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
@@ -115,7 +128,7 @@ printf '%s\n' "$directory"
 
 def run_ssh(host, script, *args, check=True, capture=True, stdin=None):
     remote = "sh -s -- " + " ".join(shlex.quote(arg) for arg in args)
-    command = ["ssh", host, remote]
+    command = ssh_command(host, remote)
     return subprocess.run(command, input=stdin if stdin is not None else script,
                           text=True, capture_output=capture, check=check)
 
@@ -138,7 +151,7 @@ printf '%s\n' "$candidate"
     result = run_ssh(host, script, check=False)
     return result.stdout.strip() if result.returncode == 0 else None
 
-def provision_terminfo(host):
+def provision_terminfo(host, directory=None, checked=False):
     directory_script = r'''
 set -eu
 if [ -n "${XDG_DATA_HOME:-}" ]; then
@@ -151,9 +164,11 @@ mkdir -p "$directory"
 chmod 700 "$directory"
 printf '%s\n' "$directory"
 '''
-    directory = run_ssh(host, directory_script).stdout.strip()
+    if directory is None:
+        directory = run_ssh(host, directory_script).stdout.strip()
     verify = 'test -r "$1/x/xterm-kitty" -o -r "$1/78/xterm-kitty"\n'
-    if run_ssh(host, verify, directory, check=False).returncode == 0:
+    if not checked and run_ssh(
+            host, verify, directory, check=False).returncode == 0:
         return
     source = HERE / "terminfo" / "xterm-kitty.terminfo"
     if not source.is_file():
@@ -163,7 +178,7 @@ printf '%s\n' "$directory"
     if has_tic:
         command = (f"umask 077; tic -x -o {shlex.quote(directory)} "
                    "/dev/stdin")
-        subprocess.run(["ssh", host, command], input=source.read_text(),
+        subprocess.run(ssh_command(host, command), input=source.read_text(),
                        text=True, check=True)
     else:
         with tempfile.TemporaryDirectory(prefix="gmux-terminfo-") as temp:
@@ -177,7 +192,7 @@ printf '%s\n' "$directory"
                        f"{shlex.quote(str(Path(remote_entry).parent))}; "
                        f"cat > {shlex.quote(remote_entry)}; "
                        f"chmod 600 {shlex.quote(remote_entry)}")
-            subprocess.run(["ssh", host, command],
+            subprocess.run(ssh_command(host, command),
                            input=entries[0].read_bytes(), check=True)
     run_ssh(host, verify, directory)
 
@@ -198,7 +213,12 @@ chmod 700 "$destination"
 printf '%s\n' "$destination"
 '''
     resolved = run_ssh(host, script, destination).stdout.strip()
-    subprocess.run(["scp", str(binary), f"{host}:{resolved}/gmux-server"],
+    scp_options = [option
+                   for pair in zip(SSH_OPTIONS[::2], SSH_OPTIONS[1::2])
+                   if "ClearAllForwardings" not in pair[1]
+                   for option in pair]
+    subprocess.run(["scp", *scp_options, str(binary),
+                    f"{host}:{resolved}/gmux-server"],
                    check=True)
     run_ssh(host, 'chmod 700 "$1/gmux-server"\n', resolved)
 
@@ -273,7 +293,42 @@ def local_dir():
         raise RuntimeError(f"insecure local socket directory: {path}")
     return path
 
-def attach(host, directory, name, client):
+def remote_state(host):
+    """Fetch all normal startup state in one SSH round trip."""
+    script = REMOTE_DIR + r'''
+socket_directory=$directory
+if command -v gmux-server >/dev/null 2>&1; then
+    candidate=$(command -v gmux-server)
+elif [ -x "$HOME/.local/bin/gmux-server" ]; then
+    candidate=$HOME/.local/bin/gmux-server
+else
+    candidate=
+fi
+if [ -n "$candidate" ] && "$candidate" 2>&1 | grep -q -- --check; then
+    server=$candidate
+else
+    server=
+fi
+if [ -n "${XDG_DATA_HOME:-}" ]; then
+    terminfo=$XDG_DATA_HOME/gmux/terminfo
+else
+    terminfo=$HOME/.local/share/gmux/terminfo
+fi
+if [ -r "$terminfo/x/xterm-kitty" ] || [ -r "$terminfo/78/xterm-kitty" ]; then
+    has_terminfo=yes
+else
+    has_terminfo=no
+fi
+printf 'server\t%s\nsockets\t%s\nterminfo\t%s\nhas_terminfo\t%s\n' \
+    "$server" "$socket_directory" "$terminfo" "$has_terminfo"
+'''
+    values = dict(line.split("\t", 1)
+                  for line in run_ssh(host, script).stdout.splitlines()
+                  if "\t" in line)
+    return (values.get("server") or None, values.get("sockets"),
+            values.get("terminfo"), values.get("has_terminfo") == "yes")
+
+def start_attachment(host, directory, name, client):
     if not SESSION_RE.fullmatch(name):
         raise RuntimeError("invalid session name")
     local = local_dir() / f"{host.replace('/', '_')}-{name}.sock"
@@ -288,17 +343,20 @@ def attach(host, directory, name, client):
         except ConnectionRefusedError:
             pass
         else:
-            raise RuntimeError(f"local forward is already active: {local}")
+            # A LocalForward from ssh_config may already provide this socket.
+            # Reuse it rather than trying to bind the same pathname again.
+            return {"client": subprocess.Popen(
+                        [client, "--connect", str(local)]),
+                    "forward": None, "local": local, "inode": None}
         finally:
             probe.close()
         local.unlink()
-    forward = subprocess.Popen([
-        "ssh", "-N", "-o", "ExitOnForwardFailure=yes",
+    forward = subprocess.Popen(ssh_forward_command(
+        "-N", "-o", "ExitOnForwardFailure=yes",
         "-o", "StreamLocalBindMask=0177",
         "-o", "StreamLocalBindUnlink=yes",
         "-L", f"{local}:{remote}", host,
-    ])
-    forward_inode = None
+    ))
     try:
         for _ in range(100):
             if local.is_socket():
@@ -308,18 +366,41 @@ def attach(host, directory, name, client):
             time.sleep(0.05)
         else:
             raise RuntimeError("timed out waiting for SSH forwarding")
-        forward_inode = local.lstat().st_ino
-        subprocess.run([client, "--connect", str(local)], check=False)
-    finally:
+        return {"client": subprocess.Popen(
+                    [client, "--connect", str(local)]),
+                "forward": forward, "local": local,
+                "inode": local.lstat().st_ino}
+    except Exception:
         forward.terminate()
         try:
             forward.wait(timeout=3)
         except subprocess.TimeoutExpired:
             forward.kill()
+        raise
+
+def stop_attachment(attachment):
+    forward = attachment["forward"]
+    if forward is not None:
+        forward.terminate()
+        try:
+            forward.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            forward.kill()
+        local = attachment["local"]
         if local.is_socket():
             info = local.lstat()
-            if info.st_uid == os.getuid() and info.st_ino == forward_inode:
+            if (info.st_uid == os.getuid()
+                    and info.st_ino == attachment["inode"]):
                 local.unlink()
+
+def reap_attachments(attachments):
+    active = []
+    for attachment in attachments:
+        if attachment["client"].poll() is None:
+            active.append(attachment)
+        else:
+            stop_attachment(attachment)
+    return active
 
 def prompt(stdscr, label):
     curses.echo()
@@ -333,12 +414,18 @@ def prompt(stdscr, label):
 
 def tui(stdscr, host, server, directory, client):
     curses.curs_set(0)
-    selected, message = 0, ""
+    stdscr.timeout(250)
+    selected, message, attachments = 0, "", []
+    refresh = True
+    entries = []
     while True:
+        attachments = reap_attachments(attachments)
         try:
-            entries = sessions(host, server, directory)
+            if refresh:
+                entries = sessions(host, server, directory)
         except Exception as error:
             entries, message = [], str(error)
+        refresh = False
         selected = min(selected, max(0, len(entries) - 1))
         stdscr.erase()
         stdscr.addstr(0, 0, f"gmux sessions on {host}  ({directory})")
@@ -348,11 +435,20 @@ def tui(stdscr, host, server, directory, client):
             stdscr.addstr(index + 3, 0, f"{marker} {name} [{status}]")
         if message:
             stdscr.addstr(max(4, len(entries) + 4), 0, message)
+        stdscr.addstr(max(5, len(entries) + 5), 0,
+                      f"{len(attachments)} attached window(s)")
         stdscr.refresh()
         key = stdscr.getch()
+        if key == -1:
+            continue
         message = ""
         if key in (ord("q"), 27):
+            for attachment in attachments:
+                attachment["client"].terminate()
+                stop_attachment(attachment)
             return
+        if key == ord("r"):
+            refresh = True
         if key in (ord("j"), curses.KEY_DOWN) and entries:
             selected = min(selected + 1, len(entries) - 1)
         elif key in (ord("k"), curses.KEY_UP) and entries:
@@ -362,16 +458,17 @@ def tui(stdscr, host, server, directory, client):
             if status == "stale":
                 message = "That socket is stale; delete it with d first."
             else:
-                curses.endwin()
                 try:
-                    attach(host, directory, name, client)
+                    attachments.append(start_attachment(
+                        host, directory, name, client))
+                    message = f"Opened {name}; gmuxctl remains available."
                 except Exception as error:
                     message = str(error)
-                stdscr.refresh()
         elif key == ord("n"):
             name = prompt(stdscr, "new session name: ")
             try:
                 create_session(host, server, directory, name)
+                refresh = True
             except Exception as error:
                 message = str(error)
         elif key == ord("d") and entries:
@@ -380,6 +477,7 @@ def tui(stdscr, host, server, directory, client):
             if answer.lower() == "y":
                 try:
                     delete_session(host, server, directory, name)
+                    refresh = True
                 except Exception as error:
                     message = str(error)
 
@@ -390,8 +488,9 @@ def main():
     parser.add_argument("--server-binary",
                         help="local gmux-server binary override")
     args = parser.parse_args()
+    SSH_OPTIONS[:] = ["-o", "ClearAllForwardings=yes"]
     client = local_program("gmux", args.client)
-    server = remote_server(args.host)
+    server, directory, terminfo, has_terminfo = remote_state(args.host)
     if not server:
         answer = input("gmux-server is missing remotely. Copy it? [y/N] ")
         if answer.lower() != "y":
@@ -400,11 +499,11 @@ def main():
         server_binary = local_program("gmux-server", args.server_binary)
         copy_server(args.host, server_binary,
                     destination or "~/.local/bin")
-        server = remote_server(args.host)
+        server, directory, terminfo, has_terminfo = remote_state(args.host)
         if not server:
             raise RuntimeError("copied gmux-server was not found remotely")
-    provision_terminfo(args.host)
-    directory = remote_dir(args.host)
+    if not has_terminfo:
+        provision_terminfo(args.host, terminfo, checked=True)
     curses.wrapper(tui, args.host, server, directory, str(client))
     return 0
 

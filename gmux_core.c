@@ -45,6 +45,7 @@ extern const unsigned char font_monaspace_argon_bold_italic[];
 extern const unsigned char font_monaspace_argon_bold_italic_end[];
 #define EMBEDDED_LEN(name) ((size_t)(name##_end - name))
 #endif
+#include "src/shared/config.inc"
 // Keep the client and server as single translation units while grouping the
 // implementation by responsibility. This avoids an internal API layer whose
 // only purpose would be to split this small program across files.
@@ -67,6 +68,7 @@ extern const unsigned char font_monaspace_argon_bold_italic_end[];
 int main(int argc, char **argv)
 {
     signal(SIGPIPE, SIG_IGN);
+    gmux_ensure_default_config();
 #ifdef GMUX_SERVER
     if (argc == 3 && strcmp(argv[1], "--check") == 0)
         return check_server(argv[2]);

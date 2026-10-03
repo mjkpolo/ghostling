@@ -49,6 +49,10 @@
   --check`, creates and deletes sessions, provisions the bundled `xterm-kitty`
   terminfo, and owns per-attachment SSH Unix-socket forwarding. Socket
   directories must be user-owned mode `0700`; sockets must be mode `0600`.
+- Eustis rejects OpenSSH ControlMaster session/forward requests, so do not rely
+  on SSH multiplexing there. It also kills a double-forked server when the SSH
+  login scope that launched it closes; a truly detached Eustis workflow still
+  needs a host-approved service/session mechanism beyond `fork()`/`setsid()`.
 - Keep new tools, dependencies, and caches inside `~/codex_projects`. Zig 0.16.0
   is installed at `../zig-0.16.0/zig`; use it rather than the older Zig on PATH.
   Set `ZIG_GLOBAL_CACHE_DIR=/home/ma148697/codex_projects/.cache/zig` and

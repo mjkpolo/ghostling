@@ -59,6 +59,29 @@ class ReleaseDownloadTest(unittest.TestCase):
         self.assertEqual(run_ssh.call_count, 2)
         download.assert_not_called()
 
+    def test_explicit_forward_is_not_cleared(self):
+        gmuxctl = load_gmuxctl()
+        gmuxctl.SSH_OPTIONS[:] = ["-o", "ClearAllForwardings=yes",
+                                  "-o", "BatchMode=yes"]
+        command = gmuxctl.ssh_forward_command("-L", "a:b", "example")
+        self.assertNotIn("ClearAllForwardings=yes", command)
+        self.assertIn("BatchMode=yes", command)
+        self.assertEqual(command[-3:], ["-L", "a:b", "example"])
+
+    def test_remote_state_uses_one_ssh_result(self):
+        gmuxctl = load_gmuxctl()
+        output = SimpleNamespace(stdout=(
+            "/tmp/noise\nserver\t/bin/gmux-server\n"
+            "sockets\t/run/user/1/gmux\n"
+            "terminfo\t/home/me/.local/share/gmux/terminfo\n"
+            "has_terminfo\tyes\n"))
+        with mock.patch.object(gmuxctl, "run_ssh",
+                               return_value=output) as run_ssh:
+            state = gmuxctl.remote_state("example")
+        self.assertEqual(state, ("/bin/gmux-server", "/run/user/1/gmux",
+                                 "/home/me/.local/share/gmux/terminfo", True))
+        run_ssh.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

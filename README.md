@@ -179,6 +179,12 @@ host lacks `gmux-server`, it asks before downloading the verified server and
 copying it to `~/.local/bin` or another directory you choose. An explicit
 local build can be selected with `--client` or `--server-binary`.
 
+The session list remains open when you attach: each Enter launches another
+GTK window in the background, so different sessions on the same host can be
+open at once. Management commands ignore `LocalForward` entries from SSH
+configuration; attachment reuses an already-live local Unix socket or creates
+the explicit socket forward it needs.
+
 The manager uses `$GMUX_SOCKET_DIR`, then `$XDG_RUNTIME_DIR/gmux`, and finally
 `/tmp/gmux-$UID`. It requires the directory to be owned by the current user
 with mode `0700`; session sockets use mode `0600`. Remote `xterm-kitty`
@@ -196,6 +202,9 @@ font = Monaspace Argon Frozen
 font-size = 24
 theme = Catppuccin Frappe
 ```
+
+Both binaries create this directory and a commented starter configuration on
+first run. Existing configuration files are never overwritten.
 
 The font must be available through Fontconfig. `font-size` accepts integer
 sizes from 6 through 96. `Ctrl+Shift++` and `Ctrl+Shift+-` adjust the font size
