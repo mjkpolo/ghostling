@@ -154,7 +154,8 @@ cmake --build build --target clean
 
 - `gmux` and `gmux-server` are built on Rocky Linux 9.4 for a glibc 2.34
   baseline. Download the single `gmux-rocky-linux-9.4-x86_64` artifact and
-  copy `gmux-server` to the remote host while keeping `gmux` locally.
+  copy `gmux-server` and its adjacent `themes` directory to the remote host
+  while keeping `gmux` locally.
 
 Run both binaries directly:
 
@@ -164,7 +165,7 @@ mkdir -p "$XDG_RUNTIME_DIR/gmux"
 ./gmux --connect "$XDG_RUNTIME_DIR/gmux/gmux.sock"
 ```
 
-### Client configuration
+### Configuration
 
 The GTK client loads `gmux/config` from GLib's user configuration directory.
 On Linux this is `$XDG_CONFIG_HOME`, falling back to `~/.config` when that
@@ -173,11 +174,16 @@ variable is unset. For example, `~/.config/gmux/config` may contain:
 ```ini
 font = Monaspace Argon Frozen
 font-size = 24
+theme = Catppuccin Frappe
 ```
 
 The font must be available through Fontconfig. `font-size` accepts integer
 sizes from 6 through 96. `Ctrl+Shift++` and `Ctrl+Shift+-` adjust the font size
-for the running client.
+for the running client. Font settings are used by the client. The theme is
+loaded by `gmux-server`, so each remote server can choose its own appearance.
+Named themes are searched in `~/.config/gmux/themes`, `$GMUX_THEME_DIR`, the
+`themes` directory beside `gmux-server`, and the system gmux data directories.
+An absolute theme file path is also accepted.
 
 ## FAQ
 

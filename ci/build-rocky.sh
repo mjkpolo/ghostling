@@ -7,6 +7,7 @@ artifact_dir="$PWD/artifacts"
 rm -rf "$artifact_dir"
 mkdir -p "$artifact_dir"
 cp build/gmux build/gmux-server "$artifact_dir/"
+cp -a build/themes "$artifact_dir/"
 
 {
   cat /etc/rocky-release

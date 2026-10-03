@@ -13,6 +13,7 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include <pwd.h>
+#include <limits.h>
 
 #if defined(__APPLE__)
 #include <util.h>
@@ -45,6 +46,180 @@
 // ---------------------------------------------------------------------------
 // PTY helpers
 // ---------------------------------------------------------------------------
+
+typedef struct {
+    GhosttyColorRgb foreground, background, cursor;
+    GhosttyColorRgb selection_foreground, selection_background;
+    GhosttyColorRgb palette[256];
+    GhosttyColorPaletteMask palette_mask;
+    bool has_foreground, has_background, has_cursor, has_palette;
+    bool has_selection_foreground, has_selection_background;
+} ServerTheme;
+
+static char *trim_ascii(char *value)
+{
+    while (*value == ' ' || *value == '\t') value++;
+    char *end = value + strlen(value);
+    while (end > value && (end[-1] == ' ' || end[-1] == '\t'
+                           || end[-1] == '\r' || end[-1] == '\n'))
+        *--end = '\0';
+    return value;
+}
+
+static bool gmux_config_dir(char *out, size_t size)
+{
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg && *xdg)
+        return snprintf(out, size, "%s/gmux", xdg) < (int)size;
+    const char *home = getenv("HOME");
+    return home && *home
+        && snprintf(out, size, "%s/.config/gmux", home) < (int)size;
+}
+
+static bool server_theme_name(char *out, size_t size)
+{
+    char config_dir[PATH_MAX], path[PATH_MAX];
+    if (!gmux_config_dir(config_dir, sizeof(config_dir))
+        || snprintf(path, sizeof(path), "%s/config", config_dir)
+            >= (int)sizeof(path)) return false;
+    FILE *file = fopen(path, "r");
+    if (!file) return false;
+    bool found = false;
+    char line[512];
+    while (fgets(line, sizeof(line), file)) {
+        char *entry = trim_ascii(line);
+        if (!*entry || *entry == '#') continue;
+        char *equals = strchr(entry, '=');
+        if (!equals) continue;
+        *equals++ = '\0';
+        if (strcmp(trim_ascii(entry), "theme") != 0) continue;
+        char *value = trim_ascii(equals);
+        if (*value && snprintf(out, size, "%s", value) < (int)size)
+            found = true;
+    }
+    fclose(file);
+    return found;
+}
+
+static bool server_theme_path(const char *name, char *out, size_t size)
+{
+    if (*name == '/' && access(name, R_OK) == 0)
+        return snprintf(out, size, "%s", name) < (int)size;
+
+    char config_dir[PATH_MAX];
+    if (gmux_config_dir(config_dir, sizeof(config_dir))
+        && snprintf(out, size, "%s/themes/%s", config_dir, name) < (int)size
+        && access(out, R_OK) == 0) return true;
+
+    const char *theme_dir = getenv("GMUX_THEME_DIR");
+    if (theme_dir && *theme_dir
+        && snprintf(out, size, "%s/%s", theme_dir, name) < (int)size
+        && access(out, R_OK) == 0) return true;
+
+#if defined(__linux__)
+    char executable[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", executable,
+                           sizeof(executable) - 1);
+    if (len > 0) {
+        executable[len] = '\0';
+        char *slash = strrchr(executable, '/');
+        if (slash) {
+            *slash = '\0';
+            if (snprintf(out, size, "%s/themes/%s", executable, name)
+                    < (int)size && access(out, R_OK) == 0) return true;
+        }
+    }
+#endif
+
+    const char *shared[] = {
+        "/usr/local/share/gmux/themes", "/usr/share/gmux/themes"
+    };
+    for (size_t i = 0; i < sizeof(shared) / sizeof(shared[0]); i++)
+        if (snprintf(out, size, "%s/%s", shared[i], name) < (int)size
+            && access(out, R_OK) == 0) return true;
+    return false;
+}
+
+static bool server_theme_load(ServerTheme *theme)
+{
+    char name[256], path[PATH_MAX];
+    if (!server_theme_name(name, sizeof(name))
+        || !server_theme_path(name, path, sizeof(path))) return false;
+    FILE *file = fopen(path, "r");
+    if (!file) return false;
+
+    ghostty_color_palette_default(theme->palette);
+    char line[512];
+    while (fgets(line, sizeof(line), file)) {
+        char *entry = trim_ascii(line);
+        if (!*entry || *entry == '#') continue;
+        char *equals = strchr(entry, '=');
+        if (!equals) continue;
+        *equals++ = '\0';
+        char *key = trim_ascii(entry);
+        char *value = trim_ascii(equals);
+        GhosttyColorRgb *color = NULL;
+        bool *present = NULL;
+        if (strcmp(key, "foreground") == 0) {
+            color = &theme->foreground;
+            present = &theme->has_foreground;
+        } else if (strcmp(key, "background") == 0) {
+            color = &theme->background;
+            present = &theme->has_background;
+        } else if (strcmp(key, "cursor-color") == 0) {
+            color = &theme->cursor;
+            present = &theme->has_cursor;
+        } else if (strcmp(key, "selection-foreground") == 0) {
+            color = &theme->selection_foreground;
+            present = &theme->has_selection_foreground;
+        } else if (strcmp(key, "selection-background") == 0) {
+            color = &theme->selection_background;
+            present = &theme->has_selection_background;
+        } else if (strcmp(key, "palette") == 0) {
+            uint8_t index;
+            GhosttyColorRgb rgb;
+            if (ghostty_color_parse_palette_entry(value, strlen(value),
+                    &index, &rgb) == GHOSTTY_SUCCESS) {
+                theme->palette[index] = rgb;
+                GHOSTTY_COLOR_PALETTE_MASK_SET(&theme->palette_mask, index);
+                theme->has_palette = true;
+            }
+            continue;
+        } else {
+            continue;
+        }
+        *present = ghostty_color_parse(value, strlen(value), color)
+            == GHOSTTY_SUCCESS;
+    }
+    fclose(file);
+
+    if (theme->has_palette) {
+        GhosttyColorRgb background = theme->has_background
+            ? theme->background : (GhosttyColorRgb){0, 0, 0};
+        GhosttyColorRgb foreground = theme->has_foreground
+            ? theme->foreground : (GhosttyColorRgb){255, 255, 255};
+        ghostty_color_palette_generate(theme->palette, &theme->palette_mask,
+            &background, &foreground, false, theme->palette);
+    }
+    return true;
+}
+
+static void server_theme_apply(GhosttyTerminal terminal,
+                               const ServerTheme *theme)
+{
+    if (theme->has_foreground)
+        ghostty_terminal_set(terminal,
+            GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &theme->foreground);
+    if (theme->has_background)
+        ghostty_terminal_set(terminal,
+            GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, &theme->background);
+    if (theme->has_cursor)
+        ghostty_terminal_set(terminal,
+            GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, &theme->cursor);
+    if (theme->has_palette)
+        ghostty_terminal_set(terminal,
+            GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, theme->palette);
+}
 
 // Spawn the user's default shell in a new pseudo-terminal.
 //
@@ -961,6 +1136,8 @@ typedef struct { uint8_t r, g, b; } SnapshotRgb;
 typedef struct {
     uint16_t rows, cols;
     SnapshotRgb background;
+    SnapshotRgb selection_background, selection_foreground;
+    bool has_selection_background, has_selection_foreground;
     bool mouse_tracking;
     bool cursor_visible;
     uint16_t cursor_col, cursor_row;
@@ -994,6 +1171,13 @@ typedef struct {
     CachedRow *rows;
     uint16_t row_count;
 } RenderClientState;
+typedef struct {
+    bool active, dragging;
+    uint16_t start_row, start_col;
+    uint16_t end_row, end_col;
+    uint16_t anchor_row, anchor_col;
+    uint8_t mode;
+} ClientSelection;
 typedef struct {
     int32_t viewport_col, viewport_row;
     uint32_t x_offset, y_offset;
@@ -1065,7 +1249,7 @@ static bool snapshot_pack(const RenderSnapshotWire *wire,
             && record.size == sizeof(SnapshotHeader)) {
             SnapshotHeader header;
             memcpy(&header, payload, sizeof(header));
-            msgpack_pack_array(&packer, 13);
+            msgpack_pack_array(&packer, 17);
             msgpack_pack_uint32(&packer, record.kind);
             msgpack_pack_uint16(&packer, header.rows);
             msgpack_pack_uint16(&packer, header.cols);
@@ -1082,6 +1266,12 @@ static bool snapshot_pack(const RenderSnapshotWire *wire,
             msgpack_pack_uint64(&packer, header.scrollbar_total);
             msgpack_pack_uint64(&packer, header.scrollbar_len);
             msgpack_pack_uint64(&packer, header.scrollbar_offset);
+            pack_rgb(&packer, header.selection_background);
+            pack_rgb(&packer, header.selection_foreground);
+            header.has_selection_background
+                ? msgpack_pack_true(&packer) : msgpack_pack_false(&packer);
+            header.has_selection_foreground
+                ? msgpack_pack_true(&packer) : msgpack_pack_false(&packer);
         } else if (record.kind == SNAPSHOT_ROW
                    && record.size >= sizeof(SnapshotRow)) {
             SnapshotRow row;
@@ -1202,10 +1392,11 @@ static bool snapshot_unpack(const void *data, size_t len,
         if (!object_u64(field[0], &kind)) goto fail;
         if (kind == SNAPSHOT_HEADER
             && (message.via.array.size == 12
-                || message.via.array.size == 13)) {
+                || message.via.array.size == 13
+                || message.via.array.size == 17)) {
             uint64_t rows, cols, cursor_col, cursor_row;
             SnapshotHeader header = {0};
-            uint32_t base = message.via.array.size == 13 ? 1 : 0;
+            uint32_t base = message.via.array.size == 12 ? 0 : 1;
             if (!object_u64(field[1], &rows)
                 || !object_u64(field[2], &cols)
                 || !unpack_rgb(field[3], &header.background)
@@ -1218,6 +1409,14 @@ static bool snapshot_unpack(const void *data, size_t len,
                 || !object_u64(field[9 + base], &header.scrollbar_total)
                 || !object_u64(field[10 + base], &header.scrollbar_len)
                 || !object_u64(field[11 + base], &header.scrollbar_offset))
+                goto fail;
+            if (message.via.array.size == 17
+                && (!unpack_rgb(field[13], &header.selection_background)
+                    || !unpack_rgb(field[14], &header.selection_foreground)
+                    || !object_bool(field[15],
+                                    &header.has_selection_background)
+                    || !object_bool(field[16],
+                                    &header.has_selection_foreground)))
                 goto fail;
             header.rows = (uint16_t)rows;
             header.cols = (uint16_t)cols;
@@ -1549,7 +1748,8 @@ static void serialize_render_snapshot(
     GhosttyRenderStateDirty dirty,
     const GhosttyTerminalScrollbar *scrollbar,
     GhosttyTerminal terminal,
-    GhosttyKittyGraphicsPlacementIterator placement_iter)
+    GhosttyKittyGraphicsPlacementIterator placement_iter,
+    const ServerTheme *theme)
 {
     GhosttyRenderStateColors colors =
         GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
@@ -1560,7 +1760,15 @@ static void serialize_render_snapshot(
         .background = snapshot_rgb(colors.background),
         .cursor_color = snapshot_rgb(
             colors.cursor_has_value ? colors.cursor : colors.foreground),
+        .has_selection_background = theme->has_selection_background,
+        .has_selection_foreground = theme->has_selection_foreground,
     };
+    if (theme->has_selection_background)
+        header.selection_background = snapshot_rgb(
+            theme->selection_background);
+    if (theme->has_selection_foreground)
+        header.selection_foreground = snapshot_rgb(
+            theme->selection_foreground);
     ghostty_render_state_get(render_state,
         GHOSTTY_RENDER_STATE_DATA_ROWS, &header.rows);
     ghostty_render_state_get(render_state,
@@ -1883,6 +2091,28 @@ static bool snapshot_rgb_equal(SnapshotRgb a, SnapshotRgb b)
     return a.r == b.r && a.g == b.g && a.b == b.b;
 }
 
+static bool selection_contains_cell(const ClientSelection *selection,
+                                    uint16_t row, uint16_t col)
+{
+    if (!selection->active) return false;
+    uint16_t start_row = selection->start_row;
+    uint16_t start_col = selection->start_col;
+    uint16_t end_row = selection->end_row;
+    uint16_t end_col = selection->end_col;
+    if (start_row > end_row
+        || (start_row == end_row && start_col > end_col)) {
+        uint16_t swap_row = start_row, swap_col = start_col;
+        start_row = end_row;
+        start_col = end_col;
+        end_row = swap_row;
+        end_col = swap_col;
+    }
+    if (row < start_row || row > end_row) return false;
+    if (row == start_row && col < start_col) return false;
+    if (row == end_row && col > end_col) return false;
+    return true;
+}
+
 // Return whether Pango may shape two neighboring cells as one text run.
 // Backgrounds intentionally do not participate: they are painted in a
 // separate pass, and allowing them to differ preserves shaping across syntax
@@ -1909,6 +2139,7 @@ static bool cells_shape_together(const SnapshotCell *a,
 
 static void cairo_snapshot_cells(cairo_t *cr,
                                  const RenderClientState *client,
+                                 const ClientSelection *selection,
                                  PangoLayout *layout,
                                  PangoFontDescription *regular,
                                  PangoFontDescription *italic,
@@ -1945,6 +2176,12 @@ static void cairo_snapshot_cells(cairo_t *cr,
             while (end < cached->cell_count
                    && cells_shape_together(&cached->cells[end - 1],
                                            &cached->cells[end])) {
+                if (client->header.has_selection_foreground
+                    && selection_contains_cell(selection, row,
+                                               cached->cells[end - 1].col)
+                        != selection_contains_cell(selection, row,
+                                                   cached->cells[end].col))
+                    break;
                 // Keep the cursor cell isolated so moving the cursor through
                 // a ligature exposes the underlying terminal characters.
                 if (client->header.cursor_visible
@@ -1969,7 +2206,11 @@ static void cairo_snapshot_cells(cairo_t *cr,
             pango_layout_set_font_description(
                 layout, first->italic ? italic : regular);
             pango_layout_set_text(layout, text->str, (int)text->len);
-            cairo_color(cr, first->foreground, alpha);
+            SnapshotRgb foreground =
+                client->header.has_selection_foreground
+                && selection_contains_cell(selection, row, first->col)
+                ? client->header.selection_foreground : first->foreground;
+            cairo_color(cr, foreground, alpha);
             cairo_move_to(cr, x, y);
             pango_cairo_show_layout(cr, layout);
             if (first->bold) {
@@ -1980,6 +2221,14 @@ static void cairo_snapshot_cells(cairo_t *cr,
 
             for (uint16_t j = i; j < end; j++) {
                 const SnapshotCell *cell = &cached->cells[j];
+                SnapshotCell selected = *cell;
+                if (client->header.has_selection_foreground
+                    && selection_contains_cell(selection, row, cell->col)) {
+                    selected.foreground =
+                        client->header.selection_foreground;
+                    selected.has_underline_color = false;
+                    cell = &selected;
+                }
                 double cell_x = pad + cell->col * cell_width;
                 cairo_cell_decorations(cr, cell, cell_x, y,
                                        cell_width, cell_height, alpha);
@@ -2056,14 +2305,6 @@ static void cairo_snapshot_images(cairo_t *cr,
     }
 }
 
-typedef struct {
-    bool active, dragging;
-    uint16_t start_row, start_col;
-    uint16_t end_row, end_col;
-    uint16_t anchor_row, anchor_col;
-    uint8_t mode;
-} ClientSelection;
-
 enum { SELECTION_CELL = 1, SELECTION_WORD, SELECTION_LINE };
 
 static void selection_bounds(const ClientSelection *selection,
@@ -2085,16 +2326,19 @@ static void selection_bounds(const ClientSelection *selection,
 }
 
 static void cairo_selection(cairo_t *cr, const ClientSelection *selection,
-                            uint16_t cols, int cell_width, int cell_height,
-                            int pad)
+                            const SnapshotHeader *header,
+                            int cell_width, int cell_height, int pad)
 {
-    if (!selection->active || !cols) return;
+    if (!selection->active || !header->cols) return;
     uint16_t start_row, start_col, end_row, end_col;
     selection_bounds(selection, &start_row, &start_col, &end_row, &end_col);
-    cairo_set_source_rgba(cr, 0.35, 0.55, 0.95, 0.45);
+    if (header->has_selection_background)
+        cairo_color(cr, header->selection_background, 1.0);
+    else
+        cairo_set_source_rgba(cr, 0.35, 0.55, 0.95, 0.45);
     for (uint16_t row = start_row; row <= end_row; row++) {
         uint16_t first = row == start_row ? start_col : 0;
-        uint16_t last = row == end_row ? end_col : cols - 1;
+        uint16_t last = row == end_row ? end_col : header->cols - 1;
         cairo_rectangle(cr, pad + first * cell_width,
                         pad + row * cell_height,
                         (last - first + 1) * cell_width, cell_height);
@@ -2118,13 +2362,12 @@ static void cairo_render_snapshot(cairo_t *cr,
 
     cairo_snapshot_images(cr, wire, GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_BG,
                           cell_width, cell_height, pad);
-    cairo_snapshot_cells(cr, client, layout, regular, italic,
+    cairo_snapshot_cells(cr, client, selection, layout, regular, italic,
                          cell_width, cell_height, pad, false);
-    cairo_selection(cr, selection, header->cols,
-                    cell_width, cell_height, pad);
+    cairo_selection(cr, selection, header, cell_width, cell_height, pad);
     cairo_snapshot_images(cr, wire, GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_TEXT,
                           cell_width, cell_height, pad);
-    cairo_snapshot_cells(cr, client, layout, regular, italic,
+    cairo_snapshot_cells(cr, client, selection, layout, regular, italic,
                          cell_width, cell_height, pad, true);
     if (header->cursor_visible) {
         cairo_color(cr, header->cursor_color, 0.5);
@@ -2203,6 +2446,7 @@ typedef struct {
     GhosttyClipboardLocation clipboard_location;
     uint8_t *clipboard_data;
     size_t clipboard_len;
+    GhosttyColorScheme color_scheme;
 } EffectsContext;
 
 // write_pty effect — the terminal calls this whenever a VT sequence
@@ -2312,15 +2556,14 @@ static GhosttyClipboardWriteResult effect_clipboard_write(
     return GHOSTTY_CLIPBOARD_WRITE_RESULT_SUCCESS;
 }
 
-// color_scheme effect — responds to CSI ? 996 n. The server does not
-// know the client OS color scheme, so ignore the query rather than guessing.
+// Report the server-owned terminal theme, not the client's desktop theme.
 static bool effect_color_scheme(GhosttyTerminal terminal, void *userdata,
                                 GhosttyColorScheme *out_scheme)
 {
     (void)terminal;
-    (void)userdata;
-    (void)out_scheme;
-    return false;
+    EffectsContext *ctx = userdata;
+    *out_scheme = ctx->color_scheme;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -2348,6 +2591,7 @@ static int run_server(int listener_fd)
     InputWire input = {0};
     RenderSnapshotWire snapshot = {0};
     EffectsContext effects = {0};
+    ServerTheme theme = {0};
     InputResize size = {
         initial_cols, initial_rows,
         initial_cell_width, initial_cell_height,
@@ -2364,6 +2608,7 @@ static int run_server(int listener_fd)
     GhosttyResult err = ghostty_terminal_new(
         NULL, &terminal, initial_cols, initial_rows);
     if (err != GHOSTTY_SUCCESS) goto cleanup;
+    if (server_theme_load(&theme)) server_theme_apply(terminal, &theme);
 
     size_t scrollback_max_lines = 1000;
     ghostty_terminal_set(terminal,
@@ -2380,6 +2625,9 @@ static int run_server(int listener_fd)
         .cell_height = initial_cell_height,
         .cols = initial_cols,
         .rows = initial_rows,
+        .color_scheme = !theme.has_background
+            || ghostty_color_perceived_luminance(&theme.background) <= 0.5
+            ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT,
     };
     ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_USERDATA, &effects);
     ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_WRITE_PTY,
@@ -2504,7 +2752,7 @@ static int run_server(int listener_fd)
                 serialize_render_snapshot(
                     &snapshot, render_state, row_iter, row_cells, dirty,
                     has_scrollbar ? &scrollbar : NULL,
-                    terminal, placement_iter);
+                    terminal, placement_iter, &theme);
                 if (effects.title_changed)
                     snapshot_record(&snapshot, SNAPSHOT_TITLE,
                                     effects.title, strlen(effects.title));
@@ -2586,6 +2834,13 @@ static int run_server_socket(const char *path, int ready_fd)
 
 static int daemonize_server(const char *path)
 {
+    char theme[256], theme_path[PATH_MAX];
+    if (server_theme_name(theme, sizeof(theme))
+        && !server_theme_path(theme, theme_path, sizeof(theme_path))) {
+        fprintf(stderr, "gmux theme not found: %s\n", theme);
+        return 1;
+    }
+
     int ready[2];
     if (pipe(ready) < 0) {
         perror("pipe");

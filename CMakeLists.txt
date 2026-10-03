@@ -99,6 +99,15 @@ if (GMUX_BUILD_SERVER)
     "${ghostty_SOURCE_DIR}/src/stb"
   )
   target_link_libraries(gmux-server ghostty-vt-static msgpack-c)
+  add_custom_command(TARGET gmux-server POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+      "${CMAKE_SOURCE_DIR}/vendor/iterm2-color-schemes/ghostty"
+      "$<TARGET_FILE_DIR:gmux-server>/themes"
+    COMMAND ${CMAKE_COMMAND} -E copy
+      "${CMAKE_SOURCE_DIR}/vendor/iterm2-color-schemes/LICENSE"
+      "$<TARGET_FILE_DIR:gmux-server>/themes/LICENSE"
+    COMMENT "Copying Ghostty color themes"
+  )
 endif()
 
 # The headless server uses forkpty().
@@ -111,4 +120,8 @@ if (GMUX_BUILD_CLIENT)
 endif()
 if (GMUX_BUILD_SERVER)
   install(TARGETS gmux-server RUNTIME DESTINATION bin)
+  install(DIRECTORY vendor/iterm2-color-schemes/ghostty/
+          DESTINATION share/gmux/themes)
+  install(FILES vendor/iterm2-color-schemes/LICENSE
+          DESTINATION share/gmux/themes)
 endif()
