@@ -2060,7 +2060,11 @@ typedef struct {
     bool active, dragging;
     uint16_t start_row, start_col;
     uint16_t end_row, end_col;
+    uint16_t anchor_row, anchor_col;
+    uint8_t mode;
 } ClientSelection;
+
+enum { SELECTION_CELL = 1, SELECTION_WORD, SELECTION_LINE };
 
 static void selection_bounds(const ClientSelection *selection,
                              uint16_t *start_row, uint16_t *start_col,
@@ -2817,6 +2821,100 @@ static const SnapshotCell *cached_cell(const CachedRow *row, uint16_t col)
     return NULL;
 }
 
+static bool gtk_word_boundary(const SnapshotCell *cell)
+{
+    static const char *boundaries = " \t'\"│`|:;,()[]{}<>$";
+    if (!cell || !cell->has_text) return true;
+    gunichar value = g_utf8_get_char_validated(cell->text, -1);
+    if (value == (gunichar)-1 || value == (gunichar)-2) return true;
+    return g_utf8_strchr(boundaries, -1, value) != NULL;
+}
+
+static bool gtk_word_at(GtkClient *client, uint16_t row, uint16_t col,
+                        uint16_t *first, uint16_t *last)
+{
+    if (row >= client->render.row_count) return false;
+    const CachedRow *cached = &client->render.rows[row];
+    const SnapshotCell *cell = cached_cell(cached, col);
+    if (!cell || !cell->has_text) return false;
+    bool boundary = gtk_word_boundary(cell);
+    *first = *last = col;
+    while (*first > 0) {
+        const SnapshotCell *previous = cached_cell(cached, *first - 1);
+        if (!previous || !previous->has_text
+            || gtk_word_boundary(previous) != boundary) break;
+        (*first)--;
+    }
+    while (*last + 1 < client->render.header.cols) {
+        const SnapshotCell *next = cached_cell(cached, *last + 1);
+        if (!next || !next->has_text
+            || gtk_word_boundary(next) != boundary) break;
+        (*last)++;
+    }
+    return true;
+}
+
+static bool gtk_line_at(GtkClient *client, uint16_t row,
+                        uint16_t *first, uint16_t *last)
+{
+    if (row >= client->render.row_count) return false;
+    const CachedRow *cached = &client->render.rows[row];
+    *first = client->render.header.cols;
+    *last = 0;
+    for (uint16_t col = 0; col < client->render.header.cols; col++) {
+        const SnapshotCell *cell = cached_cell(cached, col);
+        if (!cell || !cell->has_text) continue;
+        gunichar value = g_utf8_get_char_validated(cell->text, -1);
+        if (value == ' ' || value == '\t' || value == 0) continue;
+        if (*first == client->render.header.cols) *first = col;
+        *last = col;
+    }
+    if (*first == client->render.header.cols) {
+        *first = 0;
+        *last = client->render.header.cols - 1;
+    }
+    return true;
+}
+
+static void gtk_selection_expand(GtkClient *client, uint16_t row,
+                                 uint16_t col)
+{
+    ClientSelection *selection = &client->selection;
+    uint16_t anchor_first, anchor_last, current_first, current_last;
+    if (selection->mode == SELECTION_WORD) {
+        if (!gtk_word_at(client, selection->anchor_row,
+                         selection->anchor_col,
+                         &anchor_first, &anchor_last)
+            || !gtk_word_at(client, row, col,
+                            &current_first, &current_last)) return;
+    } else if (selection->mode == SELECTION_LINE) {
+        if (!gtk_line_at(client, selection->anchor_row,
+                         &anchor_first, &anchor_last)
+            || !gtk_line_at(client, row,
+                            &current_first, &current_last)) return;
+    } else {
+        selection->end_row = row;
+        selection->end_col = col;
+        selection->active = selection->start_row != row
+            || selection->start_col != col;
+        return;
+    }
+
+    if (row < selection->anchor_row
+        || (row == selection->anchor_row && col < selection->anchor_col)) {
+        selection->start_row = row;
+        selection->start_col = current_first;
+        selection->end_row = selection->anchor_row;
+        selection->end_col = anchor_last;
+    } else {
+        selection->start_row = selection->anchor_row;
+        selection->start_col = anchor_first;
+        selection->end_row = row;
+        selection->end_col = current_last;
+    }
+    selection->active = true;
+}
+
 static void gtk_copy_selection(GtkClient *client)
 {
     if (!client->selection.active) return;
@@ -2975,7 +3073,6 @@ static gboolean gtk_key_pressed(GtkEventControllerKey *controller,
             == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)
         && (keyval == GDK_KEY_c || keyval == GDK_KEY_C)) {
         gtk_copy_selection(client);
-        gtk_clear_selection(client);
         return TRUE;
     }
     if ((state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
@@ -2985,7 +3082,19 @@ static gboolean gtk_key_pressed(GtkEventControllerKey *controller,
         gtk_paste(client);
         return TRUE;
     }
-    gtk_clear_selection(client);
+    switch (keyval) {
+    case GDK_KEY_Shift_L: case GDK_KEY_Shift_R:
+    case GDK_KEY_Control_L: case GDK_KEY_Control_R:
+    case GDK_KEY_Alt_L: case GDK_KEY_Alt_R:
+    case GDK_KEY_Meta_L: case GDK_KEY_Meta_R:
+    case GDK_KEY_Super_L: case GDK_KEY_Super_R:
+    case GDK_KEY_Hyper_L: case GDK_KEY_Hyper_R:
+    case GDK_KEY_Caps_Lock: case GDK_KEY_Num_Lock:
+        break;
+    default:
+        gtk_clear_selection(client);
+        break;
+    }
     InputKey message = {
         .key = gdk_key_to_ghostty(keyval),
         .action = keycode < 256 && client->keys[keycode]
@@ -3039,7 +3148,6 @@ static void gtk_mouse_click(GtkGestureClick *gesture, int presses,
                             double x, double y, gpointer userdata,
                             GhosttyMouseAction action)
 {
-    (void)presses;
     GtkClient *client = userdata;
     guint button = gtk_gesture_single_get_current_button(
         GTK_GESTURE_SINGLE(gesture));
@@ -3051,16 +3159,22 @@ static void gtk_mouse_click(GtkGestureClick *gesture, int presses,
         if (action == GHOSTTY_MOUSE_ACTION_PRESS) {
             client->selection = (ClientSelection){
                 .dragging = true,
+                .active = presses > 1,
                 .start_row = row,
                 .start_col = col,
                 .end_row = row,
                 .end_col = col,
+                .anchor_row = row,
+                .anchor_col = col,
+                .mode = presses >= 3 ? SELECTION_LINE
+                    : presses == 2 ? SELECTION_WORD : SELECTION_CELL,
             };
+            gtk_selection_expand(client, row, col);
         } else {
-            client->selection.end_row = row;
-            client->selection.end_col = col;
+            gtk_selection_expand(client, row, col);
             client->selection.dragging = false;
-            if (client->selection.start_row == row
+            if (client->selection.mode == SELECTION_CELL
+                && client->selection.start_row == row
                 && client->selection.start_col == col)
                 client->selection.active = false;
         }
@@ -3111,9 +3225,8 @@ static void gtk_mouse_motion(GtkEventControllerMotion *controller,
             gtk_selection_position(client, x, y,
                                    &client->selection.end_row,
                                    &client->selection.end_col);
-            client->selection.active =
-                client->selection.start_row != client->selection.end_row
-                || client->selection.start_col != client->selection.end_col;
+            gtk_selection_expand(client, client->selection.end_row,
+                                 client->selection.end_col);
             gtk_widget_queue_draw(client->area);
         }
         return;
