@@ -54,34 +54,37 @@ add_subdirectory(vendor/msgpack-c)
 # Convert the TTF font into a C byte-array header so we don't rely on C23
 # #embed (which GCC < 15 doesn't support).
 if (GMUX_BUILD_CLIENT)
-set(FONT_INPUT "${CMAKE_SOURCE_DIR}/fonts/MonaspaceArgonFrozen-Regular.ttf")
-set(FONT_HEADER "${CMAKE_BINARY_DIR}/font_monaspace_argon.h")
-add_custom_command(
-  OUTPUT "${FONT_HEADER}"
-  COMMAND ${CMAKE_COMMAND}
-    -DINPUT=${FONT_INPUT}
-    -DOUTPUT=${FONT_HEADER}
-    -DARRAY_NAME=font_monaspace_argon
-    -P ${CMAKE_SOURCE_DIR}/bin2header.cmake
-  DEPENDS "${FONT_INPUT}" "${CMAKE_SOURCE_DIR}/bin2header.cmake"
-  COMMENT "Generating font_monaspace_argon.h"
-)
+function(embed_font output filename array_name)
+  add_custom_command(
+    OUTPUT "${output}"
+    COMMAND ${CMAKE_COMMAND}
+      -DINPUT=${CMAKE_SOURCE_DIR}/fonts/${filename}
+      -DOUTPUT=${output}
+      -DARRAY_NAME=${array_name}
+      -P ${CMAKE_SOURCE_DIR}/bin2header.cmake
+    DEPENDS "${CMAKE_SOURCE_DIR}/fonts/${filename}"
+            "${CMAKE_SOURCE_DIR}/bin2header.cmake"
+    COMMENT "Generating ${filename} header"
+  )
+endfunction()
 
-set(ITALIC_FONT_INPUT "${CMAKE_SOURCE_DIR}/fonts/MonaspaceArgonFrozen-Italic.ttf")
+set(FONT_HEADER "${CMAKE_BINARY_DIR}/font_monaspace_argon.h")
 set(ITALIC_FONT_HEADER "${CMAKE_BINARY_DIR}/font_monaspace_argon_italic.h")
-add_custom_command(
-  OUTPUT "${ITALIC_FONT_HEADER}"
-  COMMAND ${CMAKE_COMMAND}
-    -DINPUT=${ITALIC_FONT_INPUT}
-    -DOUTPUT=${ITALIC_FONT_HEADER}
-    -DARRAY_NAME=font_monaspace_argon_italic
-    -P ${CMAKE_SOURCE_DIR}/bin2header.cmake
-  DEPENDS "${ITALIC_FONT_INPUT}" "${CMAKE_SOURCE_DIR}/bin2header.cmake"
-  COMMENT "Generating font_monaspace_argon_italic.h"
-)
+set(BOLD_FONT_HEADER "${CMAKE_BINARY_DIR}/font_monaspace_argon_bold.h")
+set(BOLD_ITALIC_FONT_HEADER
+    "${CMAKE_BINARY_DIR}/font_monaspace_argon_bold_italic.h")
+embed_font("${FONT_HEADER}" "MonaspaceArgonFrozen-Regular.ttf"
+           font_monaspace_argon)
+embed_font("${ITALIC_FONT_HEADER}" "MonaspaceArgonFrozen-Italic.ttf"
+           font_monaspace_argon_italic)
+embed_font("${BOLD_FONT_HEADER}" "MonaspaceArgonFrozen-Bold.ttf"
+           font_monaspace_argon_bold)
+embed_font("${BOLD_ITALIC_FONT_HEADER}" "MonaspaceArgonFrozen-BoldItalic.ttf"
+           font_monaspace_argon_bold_italic)
 
 # --- Our Project -------------------------------------------------------------
-add_executable(gmux gmux_client.c "${FONT_HEADER}" "${ITALIC_FONT_HEADER}")
+add_executable(gmux gmux_client.c "${FONT_HEADER}" "${ITALIC_FONT_HEADER}"
+                    "${BOLD_FONT_HEADER}" "${BOLD_ITALIC_FONT_HEADER}")
 target_compile_features(gmux PRIVATE c_std_11)
 target_compile_definitions(gmux PRIVATE GMUX_CLIENT)
 target_include_directories(gmux PRIVATE

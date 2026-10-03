@@ -39,6 +39,8 @@
 // so we don't need to locate it at runtime.
 #include "font_monaspace_argon.h"
 #include "font_monaspace_argon_italic.h"
+#include "font_monaspace_argon_bold.h"
+#include "font_monaspace_argon_bold_italic.h"
 #endif
 #include "fonts/monaspace_codepoints.h"
 
@@ -2143,6 +2145,8 @@ static void cairo_snapshot_cells(cairo_t *cr,
                                  PangoLayout *layout,
                                  PangoFontDescription *regular,
                                  PangoFontDescription *italic,
+                                 PangoFontDescription *bold,
+                                 PangoFontDescription *bold_italic,
                                  int cell_width, int cell_height,
                                  int pad, bool text_pass)
 {
@@ -2203,8 +2207,10 @@ static void cairo_snapshot_cells(cairo_t *cr,
             double x = pad + first->col * cell_width;
             double y = pad + row * cell_height;
             double alpha = first->faint ? 0.5 : 1.0;
-            pango_layout_set_font_description(
-                layout, first->italic ? italic : regular);
+            PangoFontDescription *font = first->bold
+                ? (first->italic ? bold_italic : bold)
+                : (first->italic ? italic : regular);
+            pango_layout_set_font_description(layout, font);
             pango_layout_set_text(layout, text->str, (int)text->len);
             SnapshotRgb foreground =
                 client->header.has_selection_foreground
@@ -2213,10 +2219,6 @@ static void cairo_snapshot_cells(cairo_t *cr,
             cairo_color(cr, foreground, alpha);
             cairo_move_to(cr, x, y);
             pango_cairo_show_layout(cr, layout);
-            if (first->bold) {
-                cairo_move_to(cr, x + 1, y);
-                pango_cairo_show_layout(cr, layout);
-            }
             g_string_free(text, TRUE);
 
             for (uint16_t j = i; j < end; j++) {
@@ -2352,6 +2354,8 @@ static void cairo_render_snapshot(cairo_t *cr,
                                   const ClientSelection *selection,
                                   PangoFontDescription *regular,
                                   PangoFontDescription *italic,
+                                  PangoFontDescription *bold,
+                                  PangoFontDescription *bold_italic,
                                   int cell_width, int cell_height,
                                   int pad, int width, int height)
 {
@@ -2363,11 +2367,13 @@ static void cairo_render_snapshot(cairo_t *cr,
     cairo_snapshot_images(cr, wire, GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_BG,
                           cell_width, cell_height, pad);
     cairo_snapshot_cells(cr, client, selection, layout, regular, italic,
+                         bold, bold_italic,
                          cell_width, cell_height, pad, false);
     cairo_selection(cr, selection, header, cell_width, cell_height, pad);
     cairo_snapshot_images(cr, wire, GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_TEXT,
                           cell_width, cell_height, pad);
     cairo_snapshot_cells(cr, client, selection, layout, regular, italic,
+                         bold, bold_italic,
                          cell_width, cell_height, pad, true);
     if (header->cursor_visible) {
         cairo_color(cr, header->cursor_color, 0.5);
@@ -2935,6 +2941,8 @@ typedef struct {
     RenderClientState render;
     PangoFontDescription *regular;
     PangoFontDescription *italic;
+    PangoFontDescription *bold;
+    PangoFontDescription *bold_italic;
     char font_family[128];
     int font_size;
     int cell_width, cell_height;
@@ -3016,13 +3024,20 @@ static void gtk_load_config(GtkClient *client)
 
 static void gtk_apply_font(GtkClient *client)
 {
-    pango_font_description_set_family(client->regular, client->font_family);
-    pango_font_description_set_size(client->regular,
-                                    client->font_size * PANGO_SCALE);
-    pango_font_description_set_family(client->italic, client->font_family);
-    pango_font_description_set_size(client->italic,
-                                    client->font_size * PANGO_SCALE);
+    PangoFontDescription *fonts[] = {
+        client->regular, client->italic, client->bold, client->bold_italic,
+    };
+    for (size_t i = 0; i < sizeof(fonts) / sizeof(fonts[0]); i++) {
+        pango_font_description_set_family(fonts[i], client->font_family);
+        pango_font_description_set_size(fonts[i],
+                                        client->font_size * PANGO_SCALE);
+    }
     pango_font_description_set_style(client->italic, PANGO_STYLE_ITALIC);
+    pango_font_description_set_weight(client->bold, PANGO_WEIGHT_BOLD);
+    pango_font_description_set_style(client->bold_italic,
+                                     PANGO_STYLE_ITALIC);
+    pango_font_description_set_weight(client->bold_italic,
+                                      PANGO_WEIGHT_BOLD);
     if (!client->area) return;
     PangoLayout *measure = gtk_widget_create_pango_layout(client->area, "M");
     pango_layout_set_font_description(measure, client->regular);
@@ -3557,6 +3572,7 @@ static void gtk_draw(GtkDrawingArea *area, cairo_t *cr,
     cairo_render_snapshot(cr, &client->render, &client->snapshot,
                           &client->selection,
                           client->regular, client->italic,
+                          client->bold, client->bold_italic,
                           client->cell_width, client->cell_height,
                           client->pad, width, height);
     (void)area;
@@ -3663,18 +3679,20 @@ static int run_client(int socket_fd)
     if (!register_embedded_font(font_monaspace_argon,
                                 sizeof(font_monaspace_argon))
         || !register_embedded_font(font_monaspace_argon_italic,
-                                   sizeof(font_monaspace_argon_italic))) {
+                                   sizeof(font_monaspace_argon_italic))
+        || !register_embedded_font(font_monaspace_argon_bold,
+                                   sizeof(font_monaspace_argon_bold))
+        || !register_embedded_font(font_monaspace_argon_bold_italic,
+                                   sizeof(font_monaspace_argon_bold_italic))) {
         fprintf(stderr, "failed to register embedded Monaspace fonts\n");
     }
     gtk_load_config(&client);
     client.regular = pango_font_description_new();
     client.italic = pango_font_description_new();
+    client.bold = pango_font_description_new();
+    client.bold_italic = pango_font_description_new();
     gtk_apply_font(&client);
-#if GLIB_CHECK_VERSION(2, 74, 0)
     GApplicationFlags flags = G_APPLICATION_NON_UNIQUE;
-#else
-    GApplicationFlags flags = G_APPLICATION_NON_UNIQUE;
-#endif
     client.application = gtk_application_new("io.github.mjkpolo.gmux", flags);
     g_signal_connect(client.application, "activate",
                      G_CALLBACK(gtk_activate), &client);
@@ -3688,6 +3706,8 @@ static int run_client(int socket_fd)
     wire_connection_close(&client.connection);
     pango_font_description_free(client.italic);
     pango_font_description_free(client.regular);
+    pango_font_description_free(client.bold_italic);
+    pango_font_description_free(client.bold);
     g_object_unref(client.application);
     return result;
 }
