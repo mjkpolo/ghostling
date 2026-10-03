@@ -67,6 +67,7 @@ def release_asset(name, executable=False):
             return destination
     temporary = destination.with_name(f".{name}.{os.getpid()}.download")
     try:
+        print(f"Downloading {name} from {RELEASE_REPOSITORY}...", flush=True)
         with urlopen(f"{RELEASE_BASE}/{name}", timeout=60) as response:
             with temporary.open("wb") as output:
                 shutil.copyfileobj(response, output)
@@ -93,7 +94,6 @@ def local_program(name, explicit=None):
     installed = shutil.which(name)
     if installed:
         return Path(installed).resolve()
-    print(f"Downloading {name} from {RELEASE_REPOSITORY}...", flush=True)
     return release_asset(name, executable=True)
 
 REMOTE_DIR = r'''
@@ -139,9 +139,6 @@ printf '%s\n' "$candidate"
     return result.stdout.strip() if result.returncode == 0 else None
 
 def provision_terminfo(host):
-    source = HERE / "terminfo" / "xterm-kitty.terminfo"
-    if not source.is_file():
-        source = release_asset("xterm-kitty.terminfo")
     directory_script = r'''
 set -eu
 if [ -n "${XDG_DATA_HOME:-}" ]; then
@@ -155,6 +152,12 @@ chmod 700 "$directory"
 printf '%s\n' "$directory"
 '''
     directory = run_ssh(host, directory_script).stdout.strip()
+    verify = 'test -r "$1/x/xterm-kitty" -o -r "$1/78/xterm-kitty"\n'
+    if run_ssh(host, verify, directory, check=False).returncode == 0:
+        return
+    source = HERE / "terminfo" / "xterm-kitty.terminfo"
+    if not source.is_file():
+        source = release_asset("xterm-kitty.terminfo")
     has_tic = run_ssh(host, "command -v tic >/dev/null 2>&1",
                       check=False).returncode == 0
     if has_tic:
@@ -176,7 +179,6 @@ printf '%s\n' "$directory"
                        f"chmod 600 {shlex.quote(remote_entry)}")
             subprocess.run(["ssh", host, command],
                            input=entries[0].read_bytes(), check=True)
-    verify = 'test -r "$1/x/xterm-kitty" -o -r "$1/78/xterm-kitty"\n'
     run_ssh(host, verify, directory)
 
 def copy_server(host, local_binary, destination="~/.local/bin"):
@@ -199,7 +201,6 @@ printf '%s\n' "$destination"
     subprocess.run(["scp", str(binary), f"{host}:{resolved}/gmux-server"],
                    check=True)
     run_ssh(host, 'chmod 700 "$1/gmux-server"\n', resolved)
-    provision_terminfo(host)
 
 def sessions(host, server, directory):
     script = r'''

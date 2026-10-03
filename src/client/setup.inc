@@ -68,11 +68,33 @@ static bool gtk_client_send(GtkClient *client, InputKind kind,
         && wire_flush(&client->connection);
 }
 
-static bool register_embedded_font(const unsigned char *data, size_t len)
+static bool register_embedded_font(const unsigned char *data, size_t len,
+                                   const char *filename)
 {
-    char path[] = "/tmp/gmux-font-XXXXXX";
-    int fd = mkstemp(path);
-    if (fd < 0) return false;
+    char *directory = g_build_filename(
+        g_get_user_cache_dir(), "gmux", "fonts", NULL);
+    if (g_mkdir_with_parents(directory, 0700) < 0) {
+        g_free(directory);
+        return false;
+    }
+    struct stat directory_stat;
+    if (lstat(directory, &directory_stat) < 0
+        || !S_ISDIR(directory_stat.st_mode)
+        || S_ISLNK(directory_stat.st_mode)
+        || directory_stat.st_uid != getuid()
+        || chmod(directory, 0700) < 0) {
+        g_free(directory);
+        return false;
+    }
+    char *path = g_build_filename(directory, filename, NULL);
+    char *temporary = g_build_filename(directory, ".font-XXXXXX", NULL);
+    g_free(directory);
+    int fd = mkstemp(temporary);
+    if (fd < 0) {
+        g_free(path);
+        g_free(temporary);
+        return false;
+    }
     const unsigned char *cursor = data;
     size_t remaining = len;
     while (remaining) {
@@ -84,13 +106,23 @@ static bool register_embedded_font(const unsigned char *data, size_t len)
             continue;
         } else {
             close(fd);
-            unlink(path);
+            unlink(temporary);
+            g_free(path);
+            g_free(temporary);
             return false;
         }
     }
-    close(fd);
+    bool stored = fchmod(fd, 0600) == 0;
+    if (close(fd) < 0) stored = false;
+    if (!stored || rename(temporary, path) < 0) {
+        unlink(temporary);
+        g_free(path);
+        g_free(temporary);
+        return false;
+    }
     bool ok = FcConfigAppFontAddFile(NULL, (const FcChar8 *)path);
-    unlink(path);
+    g_free(path);
+    g_free(temporary);
     return ok;
 }
 

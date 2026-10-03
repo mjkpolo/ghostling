@@ -150,14 +150,27 @@ static int run_client(int socket_fd)
         return 1;
     }
     FcInit();
-    if (!register_embedded_font(font_monaspace_argon,
-                                sizeof(font_monaspace_argon))
-        || !register_embedded_font(font_monaspace_argon_italic,
-                                   sizeof(font_monaspace_argon_italic))
-        || !register_embedded_font(font_monaspace_argon_bold,
-                                   sizeof(font_monaspace_argon_bold))
-        || !register_embedded_font(font_monaspace_argon_bold_italic,
-                                   sizeof(font_monaspace_argon_bold_italic))) {
+    const unsigned char *font_data[] = {
+        font_monaspace_argon, font_monaspace_argon_italic,
+        font_monaspace_argon_bold, font_monaspace_argon_bold_italic,
+    };
+    const size_t font_len[] = {
+        EMBEDDED_LEN(font_monaspace_argon),
+        EMBEDDED_LEN(font_monaspace_argon_italic),
+        EMBEDDED_LEN(font_monaspace_argon_bold),
+        EMBEDDED_LEN(font_monaspace_argon_bold_italic),
+    };
+    const char *font_name[] = {
+        "MonaspaceArgonFrozen-Regular.ttf",
+        "MonaspaceArgonFrozen-Italic.ttf",
+        "MonaspaceArgonFrozen-Bold.ttf",
+        "MonaspaceArgonFrozen-BoldItalic.ttf",
+    };
+    bool fonts_ok = true;
+    for (size_t i = 0; i < 4; i++)
+        fonts_ok &= register_embedded_font(
+            font_data[i], font_len[i], font_name[i]);
+    if (!fonts_ok) {
         fprintf(stderr, "failed to register embedded Monaspace fonts\n");
     }
     gtk_load_config(&client);
@@ -184,6 +197,7 @@ static int run_client(int socket_fd)
     pango_font_description_free(client.bold_italic);
     pango_font_description_free(client.bold);
     g_object_unref(client.application);
+    FcConfigAppFontClear(NULL);
     return result;
 }
 
