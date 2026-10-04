@@ -36,9 +36,13 @@ static gboolean gtk_socket_ready(gint fd, GIOCondition condition,
 {
     (void)fd;
     GtkClient *client = userdata;
-    bool connected = !(condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL))
+    // HUP can accompany the final readable bytes. Dispatch complete frames
+    // already received before closing the client.
+    bool connected = !(condition & (G_IO_ERR | G_IO_NVAL))
         && wire_read(&client->connection);
-    while (connected) {
+    if (!connected && ((condition & (G_IO_ERR | G_IO_NVAL)) || errno))
+        gtk_client_fail(client, "socket read failed");
+    for (;;) {
         uint8_t *packed = NULL;
         size_t packed_len = 0;
         int frame = wire_take_frame(&client->connection, &packed, &packed_len);
@@ -46,6 +50,9 @@ static gboolean gtk_socket_ready(gint fd, GIOCondition condition,
         if (frame < 0
             || !snapshot_decode(packed, packed_len, &client->snapshot)) {
             connected = false;
+            gtk_client_fail(client, "invalid terminal update");
+            free(packed);
+            break;
         } else {
             const SnapshotHeader *header = snapshot_header(&client->snapshot);
             if (header && client->inflight_scroll_rows
@@ -67,7 +74,12 @@ static gboolean gtk_socket_ready(gint fd, GIOCondition condition,
             if (snapshot_updates_selection(&client->snapshot,
                                            &client->selection))
                 gtk_clear_selection(client);
-            render_client_apply(&client->render, &client->snapshot);
+            if (!render_client_apply(&client->render, &client->snapshot)) {
+                connected = false;
+                gtk_client_fail(client, "cannot apply terminal update");
+                free(packed);
+                break;
+            }
             gtk_scroll_send_rows(client);
             apply_snapshot_title(client->window, &client->snapshot);
             apply_snapshot_clipboard(client, &client->snapshot);
@@ -76,6 +88,8 @@ static gboolean gtk_socket_ready(gint fd, GIOCondition condition,
         free(packed);
     }
     if (!connected) {
+        if (client->connection.input.start != client->connection.input.end)
+            gtk_client_fail(client, "connection ended during a terminal update");
         client->socket_source = 0;
         g_application_quit(G_APPLICATION(client->application));
         return G_SOURCE_REMOVE;
@@ -87,6 +101,10 @@ static gboolean gtk_close_requested(GtkWindow *window, gpointer userdata)
 {
     (void)window;
     GtkClient *client = userdata;
+    if (client->momentum_tick) {
+        gtk_widget_remove_tick_callback(client->area, client->momentum_tick);
+        client->momentum_tick = 0;
+    }
     gtk_client_send(client, INPUT_DETACH, NULL, 0);
     return FALSE;
 }
@@ -146,39 +164,17 @@ static int run_client(int socket_fd)
 {
     GtkClient client = { .connection.fd = -1, .pad = 4 };
     if (!wire_connection_init(&client.connection, socket_fd)) {
+        perror("gmux: initialize socket");
         close(socket_fd);
         return 1;
     }
-    FcInit();
-    const unsigned char *font_data[] = {
-        font_monaspace_argon, font_monaspace_argon_italic,
-        font_monaspace_argon_bold, font_monaspace_argon_bold_italic,
-    };
-    const size_t font_len[] = {
-        EMBEDDED_LEN(font_monaspace_argon),
-        EMBEDDED_LEN(font_monaspace_argon_italic),
-        EMBEDDED_LEN(font_monaspace_argon_bold),
-        EMBEDDED_LEN(font_monaspace_argon_bold_italic),
-    };
-    const char *font_name[] = {
-        "MonaspaceArgonFrozen-Regular.ttf",
-        "MonaspaceArgonFrozen-Italic.ttf",
-        "MonaspaceArgonFrozen-Bold.ttf",
-        "MonaspaceArgonFrozen-BoldItalic.ttf",
-    };
-    bool fonts_ok = true;
-    for (size_t i = 0; i < 4; i++)
-        fonts_ok &= register_embedded_font(
-            font_data[i], font_len[i], font_name[i]);
-    if (!fonts_ok) {
-        fprintf(stderr, "failed to register embedded Monaspace fonts\n");
-    }
-    gtk_load_config(&client);
+    snprintf(client.font_family, sizeof(client.font_family),
+             "%s", gmux_config.font);
+    client.font_size = gmux_config.font_size;
     client.regular = pango_font_description_new();
     client.italic = pango_font_description_new();
     client.bold = pango_font_description_new();
     client.bold_italic = pango_font_description_new();
-    gtk_apply_font(&client);
     GApplicationFlags flags = G_APPLICATION_NON_UNIQUE;
     client.application = gtk_application_new("io.github.mjkpolo.gmux", flags);
     g_signal_connect(client.application, "activate",
@@ -186,7 +182,9 @@ static int run_client(int socket_fd)
     int result = g_application_run(G_APPLICATION(client.application), 0, NULL);
 
     if (client.socket_source) g_source_remove(client.socket_source);
-    if (client.momentum_tick) g_source_remove(client.momentum_tick);
+    if (client.write_source) g_source_remove(client.write_source);
+    if (client.momentum_tick)
+        gtk_widget_remove_tick_callback(client.area, client.momentum_tick);
     render_client_free(&client.render);
     free(client.input.data);
     free(client.snapshot.data);
@@ -197,8 +195,7 @@ static int run_client(int socket_fd)
     pango_font_description_free(client.bold_italic);
     pango_font_description_free(client.bold);
     g_object_unref(client.application);
-    FcConfigAppFontClear(NULL);
-    return result;
+    return client.failed ? 1 : result;
 }
 
 #endif

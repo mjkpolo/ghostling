@@ -24,8 +24,8 @@ jobs:
           submodules: recursive
       - name: Install build dependencies
         run: >-
-          dnf -y install cmake file fontconfig-devel gcc gcc-c++ git
-          gtk4-devel make tar xz
+          dnf -y install cmake file gcc gcc-c++ git
+          gtk4-devel make python3 tar xz
       - name: Build client and server
         run: |
           set -o pipefail

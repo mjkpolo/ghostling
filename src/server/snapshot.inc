@@ -1,5 +1,5 @@
 #ifdef GMUX_SERVER
-static void snapshot_kitty_images(
+static bool snapshot_kitty_images(
     RenderSnapshotWire *wire, GhosttyTerminal terminal,
     GhosttyKittyGraphics graphics,
     GhosttyKittyGraphicsPlacementIterator placement_iter,
@@ -10,7 +10,7 @@ static void snapshot_kitty_images(
     if (ghostty_kitty_graphics_get(graphics,
             GHOSTTY_KITTY_GRAPHICS_DATA_PLACEMENT_ITERATOR,
             &placement_iter) != GHOSTTY_SUCCESS)
-        return;
+        return false;
 
     while (ghostty_kitty_graphics_placement_next(placement_iter)) {
         uint32_t image_id = 0;
@@ -35,7 +35,8 @@ static void snapshot_kitty_images(
         GhosttyKittyImageFormat format = GHOSTTY_KITTY_IMAGE_FORMAT_RGBA;
         ghostty_kitty_graphics_image_get(handle,
             GHOSTTY_KITTY_IMAGE_DATA_FORMAT, &format);
-        if (format != GHOSTTY_KITTY_IMAGE_FORMAT_RGBA) continue;
+        if (format != GHOSTTY_KITTY_IMAGE_FORMAT_RGBA
+            && format != GHOSTTY_KITTY_IMAGE_FORMAT_RGB) continue;
 
         const uint8_t *pixels = NULL;
         size_t pixel_len = 0;
@@ -43,10 +44,12 @@ static void snapshot_kitty_images(
             GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR, &pixels);
         ghostty_kitty_graphics_image_get(handle,
             GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN, &pixel_len);
-        if (!pixels || pixel_len > UINT32_MAX
-            || pixel_len < (size_t)image.image_w * image.image_h * 4)
+        uint64_t count = (uint64_t)image.image_w * image.image_h;
+        unsigned components = format == GHOSTTY_KITTY_IMAGE_FORMAT_RGB ? 3 : 4;
+        if (!pixels || count > (UINT32_MAX - sizeof(image)) / 4
+            || pixel_len != count * components)
             continue;
-        image.pixel_len = (uint32_t)pixel_len;
+        image.pixel_len = (uint32_t)(count * 4);
 
         if (ghostty_kitty_graphics_placement_grid_size(
                 placement_iter, handle, terminal,
@@ -62,16 +65,29 @@ static void snapshot_kitty_images(
         ghostty_kitty_graphics_placement_get(placement_iter,
             GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Y_OFFSET, &image.y_offset);
 
-        SnapshotRecord record = {
-            SNAPSHOT_IMAGE, (uint32_t)(sizeof(image) + pixel_len)
-        };
-        snapshot_append(wire, &record, sizeof(record));
-        snapshot_append(wire, &image, sizeof(image));
-        snapshot_append(wire, pixels, pixel_len);
+        // Kitty f=24 stays RGB in libghostty; the wire uses one RGBA format
+        // for both raw Kitty images and decoded PNGs.
+        uint8_t *rgba = NULL;
+        if (components == 3) {
+            rgba = malloc(image.pixel_len);
+            if (!rgba) return false;
+            for (size_t i = 0; i < count; i++) {
+                memcpy(rgba + 4 * i, pixels + 3 * i, 3);
+                rgba[4 * i + 3] = 255;
+            }
+            pixels = rgba;
+        }
+        SnapshotRecord record = { SNAPSHOT_IMAGE, sizeof(image) + image.pixel_len };
+        bool ok = snapshot_append(wire, &record, sizeof(record))
+            && snapshot_append(wire, &image, sizeof(image))
+            && snapshot_append(wire, pixels, image.pixel_len);
+        free(rgba);
+        if (!ok) return false;
     }
+    return true;
 }
 
-static void serialize_render_snapshot(
+static bool serialize_render_snapshot(
     RenderSnapshotWire *wire, GhosttyRenderState render_state,
     GhosttyRenderStateRowIterator row_iter,
     GhosttyRenderStateRowCells cells,
@@ -85,7 +101,7 @@ static void serialize_render_snapshot(
         GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
     if (ghostty_render_state_get(render_state,
             GHOSTTY_RENDER_STATE_DATA_COLORS, &colors) != GHOSTTY_SUCCESS)
-        return;
+        return false;
 
     SnapshotHeader header = {
         .background = snapshot_rgb(colors.background),
@@ -140,19 +156,20 @@ static void serialize_render_snapshot(
         header.scrollbar_len = scrollbar->len;
         header.scrollbar_offset = scrollbar->offset;
     }
-    snapshot_record(wire, SNAPSHOT_HEADER, &header, sizeof(header));
+    if (!snapshot_record(wire, SNAPSHOT_HEADER, &header, sizeof(header)))
+        return false;
 
     GhosttyKittyGraphics graphics = NULL;
     bool has_kitty = ghostty_terminal_get(terminal,
         GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &graphics) == GHOSTTY_SUCCESS
         && graphics != NULL;
-    if (has_kitty && placement_iter)
-        snapshot_kitty_images(wire, terminal, graphics, placement_iter,
-            GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_BG);
+    if (has_kitty && placement_iter
+        && !snapshot_kitty_images(wire, terminal, graphics, placement_iter,
+            GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_BG)) return false;
 
     if (ghostty_render_state_get(render_state,
             GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &row_iter) != GHOSTTY_SUCCESS)
-        return;
+        return false;
 
     const bool send_all = dirty == GHOSTTY_RENDER_STATE_DIRTY_FULL;
     while (ghostty_render_state_row_iterator_next(row_iter)) {
@@ -165,7 +182,7 @@ static void serialize_render_snapshot(
 
         if (ghostty_render_state_row_get(row_iter,
                 GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &cells) != GHOSTTY_SUCCESS) {
-            continue;
+            return false;
         }
 
         // One record is one complete row replacement. Even an empty row is
@@ -176,14 +193,14 @@ static void serialize_render_snapshot(
         if (ghostty_render_state_row_get(row_iter,
                 GHOSTTY_RENDER_STATE_ROW_DATA_VIEWPORT_Y,
                 &row.row) != GHOSTTY_SUCCESS)
-            continue;
+            return false;
         GhosttyRow raw_row = 0;
         if (ghostty_render_state_row_get(row_iter,
                 GHOSTTY_RENDER_STATE_ROW_DATA_RAW, &raw_row) == GHOSTTY_SUCCESS)
             ghostty_row_get(raw_row, GHOSTTY_ROW_DATA_WRAP, &row.wrapped);
-        snapshot_append(wire, &record, sizeof(record));
+        if (!snapshot_append(wire, &record, sizeof(record))) return false;
         const size_t row_offset = wire->len;
-        snapshot_append(wire, &row, sizeof(row));
+        if (!snapshot_append(wire, &row, sizeof(row))) return false;
 
         uint16_t col = 0;
         while (ghostty_render_state_row_cells_next(cells)) {
@@ -199,11 +216,6 @@ static void serialize_render_snapshot(
                     &raw_cell) == GHOSTTY_SUCCESS)
                 ghostty_cell_get(raw_cell, GHOSTTY_CELL_DATA_WIDE, &wide);
             cell.wide = (uint8_t)wide;
-            uint32_t grapheme_len = 0;
-            ghostty_render_state_row_cells_get(cells,
-                GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN,
-                &grapheme_len);
-
             GhosttyColorRgb fg = colors.foreground;
             GhosttyColorRgb bg = colors.background;
             ghostty_render_state_row_cells_get(cells,
@@ -235,25 +247,23 @@ static void serialize_render_snapshot(
             cell.has_underline_color = snapshot_style_color(
                 style.underline_color, &colors, &cell.underline_color);
 
-            if (grapheme_len) {
-                uint32_t codepoints[16];
-                uint32_t len = grapheme_len < 16 ? grapheme_len : 16;
-                ghostty_render_state_row_cells_get(cells,
-                    GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF,
-                    codepoints);
-                int pos = 0;
-                for (uint32_t i = 0; i < len && pos < 60; i++) {
-                    char utf8[4];
-                    int count = utf8_encode(codepoints[i], utf8);
-                    memcpy(cell.text + pos, utf8, (size_t)count);
-                    pos += count;
-                }
-                cell.text[pos] = 0;
-                cell.has_text = true;
-            }
+            // Let libghostty encode the cluster with a checked capacity. The
+            // codepoint-buffer API copies the entire cluster, not just 16
+            // codepoints, so using it with a fixed array could overflow.
+            GhosttyBuffer text = {
+                .ptr = (uint8_t *)cell.text, .cap = sizeof(cell.text) - 1,
+            };
+            GhosttyResult text_result = ghostty_render_state_row_cells_get(
+                cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8,
+                &text);
+            if (text_result == GHOSTTY_OUT_OF_SPACE)
+                memcpy(cell.text, "\xef\xbf\xbd", 4);
+            else if (text_result != GHOSTTY_SUCCESS)
+                return false;
+            cell.has_text = cell.text[0] != '\0';
 
             if (cell.has_text || cell.has_background) {
-                snapshot_append(wire, &cell, sizeof(cell));
+                if (!snapshot_append(wire, &cell, sizeof(cell))) return false;
                 row.cell_count++;
             }
             col++;
@@ -270,15 +280,16 @@ static void serialize_render_snapshot(
     }
 
     if (has_kitty && placement_iter) {
-        snapshot_kitty_images(wire, terminal, graphics, placement_iter,
-            GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_TEXT);
-        snapshot_kitty_images(wire, terminal, graphics, placement_iter,
-            GHOSTTY_KITTY_PLACEMENT_LAYER_ABOVE_TEXT);
+        if (!snapshot_kitty_images(wire, terminal, graphics, placement_iter,
+                GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_TEXT)
+            || !snapshot_kitty_images(wire, terminal, graphics, placement_iter,
+                GHOSTTY_KITTY_PLACEMENT_LAYER_ABOVE_TEXT)) return false;
     }
 
     GhosttyRenderStateDirty clean = GHOSTTY_RENDER_STATE_DIRTY_FALSE;
     ghostty_render_state_set(render_state,
         GHOSTTY_RENDER_STATE_OPTION_DIRTY, &clean);
+    return true;
 }
 
 #endif

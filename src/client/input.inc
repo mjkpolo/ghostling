@@ -85,17 +85,9 @@ static void gtk_key_released(GtkEventControllerKey *controller,
 {
     (void)controller;
     GtkClient *client = userdata;
-    if ((state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
-            == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)
-        && (keyval == GDK_KEY_c || keyval == GDK_KEY_C
-            || keyval == GDK_KEY_v || keyval == GDK_KEY_V
-            || keyval == GDK_KEY_plus || keyval == GDK_KEY_equal
-            || keyval == GDK_KEY_KP_Add || keyval == GDK_KEY_minus
-            || keyval == GDK_KEY_underscore
-            || keyval == GDK_KEY_KP_Subtract)) {
-        if (keycode < 256) client->keys[keycode] = false;
-        return;
-    }
+    // Release only keys whose press reached the terminal. The user may
+    // release Ctrl/Shift before a local shortcut's letter key.
+    if (keycode < 256 && !client->keys[keycode]) return;
     InputKey message = {
         .key = gdk_key_to_ghostty(keyval),
         .action = GHOSTTY_KEY_ACTION_RELEASE,
@@ -164,7 +156,11 @@ static void gtk_mouse_click(GtkGestureClick *gesture, int presses,
 static void gtk_mouse_pressed(GtkGestureClick *gesture, int presses,
                               double x, double y, gpointer userdata)
 {
-    gtk_set_pending_clipboard(userdata);
+    GtkClient *client = userdata;
+    gtk_set_pending_clipboard(client);
+    // Retry a remote clipboard write once we have a Wayland input serial;
+    // retaining it indefinitely would overwrite later copies from other apps.
+    g_clear_pointer(&client->pending_clipboard, g_free);
     gtk_mouse_click(gesture, presses, x, y, userdata,
                     GHOSTTY_MOUSE_ACTION_PRESS);
 }
@@ -315,6 +311,11 @@ static void gtk_focus_changed(GtkWidget *widget, GParamSpec *spec,
     (void)spec;
     GtkClient *client = userdata;
     InputFocus focus = { .focused = gtk_widget_has_focus(widget) };
+    if (!focus.focused) {
+        memset(client->keys, 0, sizeof(client->keys));
+        client->mouse_buttons = 0;
+        client->selection.dragging = false;
+    }
     gtk_client_send(client, INPUT_FOCUS, &focus, sizeof(focus));
 }
 

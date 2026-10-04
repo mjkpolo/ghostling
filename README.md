@@ -1,8 +1,8 @@
-# Ghostling - Minimal libghostty Terminal
+# gmux — a small remote terminal built from Ghostling
 
-Ghostling is a demo project meant to highlight a minimum
-functional terminal built on the libghostty C API in a
-[single C file](https://github.com/ghostty-org/ghostling/blob/main/main.c).
+This is a learning project based on
+[Ghostling](https://github.com/ghostty-org/ghostling), a minimal terminal using
+libghostty's C API.
 
 The Linux client uses GTK4/GDK for native Wayland/X11 windowing and Cairo/Pango
 for its initial renderer. The authoritative terminal lives in a separate,
@@ -11,10 +11,8 @@ socket.
 
 > [!WARNING]
 >
-> The Ghostling terminal isn't meant to be a full featured, daily use
-> terminal. It is a minimal viable terminal based on libghostty. Also, since
-> this is basically a demo, I didn't carefully audit every single place for
-> correctness, and this is C, so you've been warned!
+> This is an experimental terminal, not a replacement for a mature terminal's
+> compatibility and security testing.
 
 <p align="center">
   <img src="demo.gif" alt="Ghostling Demo" />
@@ -26,15 +24,10 @@ Libghostty is an embeddable library extracted from [Ghostty's](https://ghostty.o
 exposing a C and Zig API so any application can embed correct, fast terminal
 emulation.
 
-Ghostling uses **libghostty-vt**, a zero-dependency library (not even libc) that
-handles VT sequence parsing, terminal state management (cursor position,
-styles, text reflow, scrollback, etc.), and renderer state management. It
-contains no renderer drawing or windowing code; the consumer (Ghostling, in
-this case) provides its own. The core logic is extracted directly from Ghostty
-and inherits all of its real-world benefits: excellent, accurate, and complete
-terminal emulation support, SIMD-optimized parsing, leading Unicode support,
-highly optimized memory usage, and a robust, fuzzed, and tested codebase, all
-proven by millions of daily active users of Ghostty GUI.
+The server uses **libghostty-vt** for VT parsing, cursor and cell state,
+styles, text reflow, scrollback, and render-state snapshots. It contains no
+windowing or drawing code. Our GTK client draws the resulting rows and images;
+it does not parse the application's VT output again.
 
 ## Features
 
@@ -44,55 +37,33 @@ features you _do get_:
 - Resize with text reflow
 - Full 24-bit color and 256-color palette support
 - Bold, italic, and inverse text styles
-- Unicode and multi-codepoint grapheme handling (no shaping or layout)
+- Unicode text, Pango/HarfBuzz shaping, and ligatures
 - Keyboard input with modifier support (Shift, Ctrl, Alt, Super)
 - Kitty keyboard protocol
 - Kitty graphics protocol
 - Mouse tracking (X10, normal, button, and any-event modes)
 - Mouse reporting formats (SGR, URxvt, UTF8, X10)
 - Scroll wheel support (viewport scrollback or forwarded to applications)
-- Scrollbar with mouse drag-to-scroll
+- Scrollbar position indicator
 - Focus reporting (CSI I / CSI O)
-- And more. Effectively all the terminal emulation features supported
-  by Ghostty!
+- Local text selection and clipboard shortcuts
+- OSC 52 clipboard writes
+- Configurable installed fonts and server-owned color themes
+- SSH session management through `gmuxctl`
 
-### What Is Coming
-
-These features aren't properly exposed by libghostty-vt yet but will be:
-
-- OSC clipboard support
-
-These are things that could work but haven't been tested or aren't
-implemented in Ghostling itself:
-
-- Windows support (libghostty-vt supports Windows)
-
-This list is incomplete and we'll add things as we find them.
-
-### What You Won't Ever Get
-
-libghostty is focused on core terminal emulation features. As such,
-you don't get features that are provided by the GUI above the terminal
-emulation layer, such as:
-
-- Tabs
-- Multiple windows
-- Splits
-- Session management
-- Configuration file or GUI
-- Search UI (although search internals are provided by libghostty-vt)
-
-These are the things that libghostty consumers are expected to implement
-on their own, if they want them. This example doesn't implement these
-to try to stay as minimal as possible.
-
-### Current input work
+### Limitations
 
 There are some known issues with this demo:
 
 - GTK now supplies event-driven key press, repeat, release, modifier, and
   consumed-modifier information. Compose/IME commit handling and the complete
   physical-key mapping are still being ported from Ghostty's GTK frontend.
+- The current client targets Linux. There are no tabs, splits, or search UI.
+- A server accepts one attached GUI at a time; open separate sessions for
+  simultaneous windows.
+- Double-forking detaches from a shell, but cannot override a host policy that
+  terminates processes at logout. Persistence depends on the host's session
+  management; the SSH transport alone does not guarantee it.
 
 ## Building
 
@@ -102,7 +73,7 @@ Requirements:
 - [Ninja](https://ninja-build.org/)
 - A C compiler
 - `curl`, `sha256sum`, and `tar` for `./build.sh` to fetch Zig 0.16.0
-- Linux (Ubuntu/Debian): `sudo apt install -y ninja-build build-essential git libgtk-4-dev libfontconfig-dev`
+- Linux (Ubuntu/Debian): `sudo apt install -y ninja-build build-essential git libgtk-4-dev`
 
 ```sh
 ./build.sh
@@ -150,6 +121,22 @@ To clean up the build directory:
 cmake --build build --target clean
 ```
 
+### Regression tests
+
+After building both binaries:
+
+```sh
+./tests/run.sh
+# Optional memory/undefined-behavior checks for our C code:
+SANITIZE=1 ./tests/run.sh
+```
+
+The tests exercise queued socket/PTY writes, fragmented messages and EOF,
+malformed input, long graphemes, RGB/RGBA Kitty images, row-cache resizing, local shortcuts, config
+creation, session-manager behavior, and health/kill commands while attached.
+They use private temporary sockets and do not connect to a remote host. The
+vendored libraries are the normal build's libraries, not sanitizer rebuilds.
+
 ## Linux releases
 
 - Every push to `gmux-codex` publishes a GitHub release containing `gmux`,
@@ -173,17 +160,24 @@ directories, detect stale sessions, and manage SSH Unix-socket forwarding:
 ```
 
 `gmuxctl` is a standalone Python script. It first looks beside itself and on
-`PATH`; if `gmux` is missing, it downloads and SHA-256 verifies the latest
-Rocky release into `$XDG_CACHE_HOME/gmux` (or `~/.cache/gmux`). If the remote
+`PATH`, then in its download cache; if `gmux` is missing, it downloads and
+SHA-256 verifies the latest Rocky release into `$XDG_CACHE_HOME/gmux` (or
+`~/.cache/gmux`). Cached binaries are reused without a network update check;
+install a new release beside the script or remove the cached binary to update.
+If the remote
 host lacks `gmux-server`, it asks before downloading the verified server and
 copying it to `~/.local/bin` or another directory you choose. An explicit
 local build can be selected with `--client` or `--server-binary`.
 
 The session list remains open when you attach: each Enter launches another
 GTK window in the background, so different sessions on the same host can be
-open at once. Management commands ignore `LocalForward` entries from SSH
-configuration; attachment reuses an already-live local Unix socket or creates
-the explicit socket forward it needs.
+open at once. One private OpenSSH ControlMaster connection serves the manager
+and all of its windows. It uses your SSH host, authentication, and jump-host
+configuration, while excluding configured port forwards. Each attachment gets
+its own private directory and Unix-socket forward; existing sockets are never
+reused or replaced. Closing a window removes its forward. Quitting the manager
+closes its windows and SSH connection; the remote sessions remain subject to
+the remote host's normal session-lifetime policy.
 
 The manager uses `$GMUX_SOCKET_DIR`, then `$XDG_RUNTIME_DIR/gmux`, and finally
 `/tmp/gmux-$UID`. It requires the directory to be owned by the current user
@@ -193,12 +187,11 @@ access is required.
 
 ### Configuration
 
-The GTK client loads `gmux/config` from GLib's user configuration directory.
-On Linux this is `$XDG_CONFIG_HOME`, falling back to `~/.config` when that
-variable is unset. For example, `~/.config/gmux/config` may contain:
+Both binaries load `$XDG_CONFIG_HOME/gmux/config`, falling back to
+`~/.config/gmux/config` when that variable is unset or relative. For example:
 
 ```ini
-font = Monaspace Argon Frozen
+font = Monaspace Argon Frozen, monospace
 font-size = 24
 theme = Catppuccin Frappe
 ```
@@ -206,11 +199,14 @@ theme = Catppuccin Frappe
 Both binaries create this directory and a commented starter configuration on
 first run. Existing configuration files are never overwritten.
 
-The font must be available through Fontconfig. `font-size` accepts integer
+Fonts are discovered by Pango through the system font configuration; gmux no
+longer bundles or extracts font files. Install Monaspace yourself to use it,
+or select another installed family. The default family list falls back to
+`monospace` when Monaspace is unavailable. `font-size` accepts integer
 sizes from 6 through 96. `Ctrl+Shift++` and `Ctrl+Shift+-` adjust the font size
 for the running client. Font settings are used by the client. The theme is
 loaded by `gmux-server`, so each remote server can choose its own appearance.
-Named themes are searched in `~/.config/gmux/themes`, `$GMUX_THEME_DIR`, the
+Named themes are searched in the config directory's `themes` folder, `$GMUX_THEME_DIR`, the
 `themes` directory beside `gmux-server`, and the system gmux data directories.
 An absolute theme file path is also accepted.
 
@@ -239,13 +235,43 @@ used; it's even standalone WASM-compatible for browsers and other environments.
 
 libghostty provides a [high-performance render state API](https://libghostty.tip.ghostty.org/group__render.html)
 which only keeps track of the _state_ required to build a renderer. This is the
-same API used by Ghostty GUI for Metal and OpenGL rendering and in this repository
-for the Cairo/Pango renderer in this repository. You can layer any renderer on
-top of this!
+C interface to Ghostty's render state. Our server copies those values into
+MessagePack messages; the client maintains rows and renders them with
+Cairo/Pango. Ghostty's own GUI uses its native Zig rendering stack.
 
 ### Why CMake and GTK?
 
 I needed to pick _something_. Really, any build system and any library
 could be used. CMake is widely used and supported. GTK gives the Linux client
-native Wayland input, layout-aware key events, IME integration, clipboard
+native Wayland input, layout-aware key events, clipboard
 access, and an event loop close to the one used by Ghostty itself.
+
+### What did the source review change?
+
+- **Fonts:** Ghostty and WezTerm both bundle fonts and can open them directly
+  from memory. Our Pango integration instead extracted them to temporary files
+  and registered them with Fontconfig. We removed that extra lifecycle and use
+  installed fonts, leaving discovery, fallback, weight, and style to Pango.
+  This is a simplification for our Linux client, not a claim that bundled fonts
+  are bad. Sources:
+  [Ghostty embedded fonts](https://github.com/ghostty-org/ghostty/blob/76895d97b74ff6b24c2b1543bcd69ccc18048a4d/src/font/embedded.zig#L8-L19),
+  [Ghostty memory faces](https://github.com/ghostty-org/ghostty/blob/76895d97b74ff6b24c2b1543bcd69ccc18048a4d/src/font/face/freetype.zig#L79-L89),
+  [WezTerm built-ins](https://github.com/wezterm/wezterm/blob/b09b56c29c1e367e598b60ca266e2cc9038751e0/wezterm-font/src/parser.rs#L816-L884),
+  [WezTerm memory stream](https://github.com/wezterm/wezterm/blob/b09b56c29c1e367e598b60ca266e2cc9038751e0/wezterm-font/src/ftwrap.rs#L1287-L1302).
+- **Queued writes:** Ghostty retains owned PTY-write buffers until completion.
+  gmux now retains its unwritten suffix too, using the existing single-threaded
+  poll/GLib loops. No worker thread, locks, or queue dependency is needed.
+  [Ghostty queueWrite](https://github.com/ghostty-org/ghostty/blob/76895d97b74ff6b24c2b1543bcd69ccc18048a4d/src/termio/Exec.zig#L403-L470).
+- **Render boundary:** WezTerm sends semantic dirty lines and metadata, not
+  rendered text pixels. Our row cache remains a sensible smaller analogue;
+  adopting WezTerm's full pane/session interfaces would add machinery we do
+  not need. We are not wire-compatible: WezTerm has stable row IDs, sequence
+  numbers, and on-demand line retrieval; gmux sends changed viewport/overscan
+  rows and currently resends visible image pixels with snapshots.
+  [WezTerm change computation](https://github.com/wezterm/wezterm/blob/b09b56c29c1e367e598b60ca266e2cc9038751e0/wezterm-mux-server-impl/src/sessionhandler.rs#L51-L157).
+
+The review also removed duplicated config/kill implementations and obsolete
+Raylib container/profiling files. It did not replace the renderer with a GPU
+pipeline or complete IME support. Complex-script cell positioning, per-redraw
+image conversion, and the fixed 63-byte grapheme payload remain limitations;
+oversized graphemes display a replacement glyph instead of overrunning memory.

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ $# -gt 1 || ( $# -eq 1 && $1 != --server-only ) ]]; then
+  printf 'usage: %s [--server-only]\n' "$0" >&2
+  exit 1
+fi
+
 project_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 projects_dir=$(dirname -- "$project_dir")
 zig_dir="$projects_dir/zig-0.16.0"

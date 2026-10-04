@@ -49,23 +49,26 @@
   --check`, creates and deletes sessions, provisions the bundled `xterm-kitty`
   terminfo, and owns per-attachment SSH Unix-socket forwarding. Socket
   directories must be user-owned mode `0700`; sockets must be mode `0600`.
-- Eustis rejects OpenSSH ControlMaster session/forward requests, so do not rely
-  on SSH multiplexing there. It also kills a double-forked server when the SSH
-  login scope that launched it closes; a truly detached Eustis workflow still
-  needs a host-approved service/session mechanism beyond `fork()`/`setsid()`.
+- The manager owns a private SSH ControlMaster and a distinct directory per
+  attachment. Do not reuse arbitrary existing forwards or probe them by
+  attaching a GUI. `--check` returns 0 for idle, 2 for attached/busy, and 1 for
+  stale/invalid. Check and kill must remain responsive while a GUI is attached.
+- Earlier Eustis tests observed ControlMaster permission failures and servers
+  disappearing after SSH logout, but did not establish the cause. Do not treat
+  those observations as proof of host policy. ControlMaster errors can arise
+  locally (including different UIDs across execution contexts); double-forking
+  alone cannot override logout cleanup imposed by a host's session manager.
 - Keep new tools, dependencies, and caches inside `~/codex_projects`. Zig 0.16.0
   is installed at `../zig-0.16.0/zig`; use it rather than the older Zig on PATH.
   Set `ZIG_GLOBAL_CACHE_DIR=/home/ma148697/codex_projects/.cache/zig` and
   `ZIG_LOCAL_CACHE_DIR=/home/ma148697/codex_projects/ghostling/build/.zig-cache`.
-- The current prototype embeds Monaspace Argon Frozen Regular and Italic at size
-  24 and loads all 953 Unicode characters mapped by these bundled font files.
-- Keep the dirty-frame render cache disabled until the repeated Kitty-image
-  transition test is understood and fixed. The comparison renderer should draw
-  terminal and Kitty state every frame; do not reintroduce the cache merely
-  because text-only transitions pass.
-- The user runs Sway and remaps Caps Lock to Ctrl through XKB. The client is
-  migrating from Raylib/GLFW/XWayland to GTK4/GDK. The first GTK build was
-  confirmed by Sway as a native Wayland `xdg_shell` surface.
+- The client uses installed fonts through Pango; it no longer embeds or
+  extracts font files. Default: `Monaspace Argon Frozen, monospace`, size 24.
+- Rendering and input are event-driven. The server sends changed rows; the GTK
+  client retains the current visible rows and overscan. Preserve Kitty images
+  when changing dirty tracking or snapshot handling.
+- The user runs Sway and remaps Caps Lock to Ctrl through XKB. The GTK4/GDK
+  client supports native Wayland; use that backend for input testing.
 
 ## Building
 
@@ -77,6 +80,14 @@
 
 ## Live GUI Testing Under Sway
 
+- Run `./tests/run.sh` after building; `SANITIZE=1` enables ASan/UBSan for our
+  C test translation units. These are local tests, not permission to use a
+  public remote host. Inspect screenshots before claiming visual success:
+  powered-off/locked outputs can produce entirely black captures. An isolated
+  Sway instance with `WLR_BACKENDS=headless`, `WLR_RENDERER=pixman`, and a private
+  `XDG_RUNTIME_DIR` can test native Wayland rendering without changing the user's
+  desktop. Stop the test compositor/client/server afterward.
+
 - A useful end-to-end renderer test is to launch Ghostling with `SHELL` set to a
   temporary executable script. The script can print deterministic ANSI/VT test
   output and then remain alive. This exercises the real PTY -> libghostty ->
@@ -85,7 +96,7 @@
   and Powerline output. Put literal UTF-8 characters in a POSIX shell script;
   portable `printf` does not interpret `\uXXXX` escapes.
 - Locate the window with `swaymsg -t get_tree`. A native build reports
-  `app_id: org.ghostty.gmux` and `shell: xdg_shell`; an XWayland regression has
+  `app_id: io.github.mjkpolo.gmux` and `shell: xdg_shell`; an XWayland regression has
   a non-null X11 window id instead.
 - To check cached clean-frame rendering, capture the idle window twice several
   seconds apart, compare SHA-256 hashes, and use ImageMagick

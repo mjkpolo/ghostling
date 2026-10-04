@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ./build.sh
+./tests/run.sh
 
 artifact_dir="$PWD/artifacts"
 rm -rf "$artifact_dir"

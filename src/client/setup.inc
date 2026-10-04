@@ -1,34 +1,4 @@
 #ifdef GMUX_CLIENT
-static int kill_server(const char *path)
-{
-    int fd = unix_socket(path, false);
-    if (fd < 0) {
-        perror("connect to Unix socket");
-        return 1;
-    }
-    WireConnection connection = { .fd = -1 };
-    InputWire command = {0};
-    int result = 1;
-    if (!wire_connection_init(&connection, fd)
-        || !input_append(&command, INPUT_SHUTDOWN, NULL, 0)
-        || !input_queue(&connection, &command))
-        goto cleanup;
-
-    while (connection.output.start < connection.output.end) {
-        if (!wire_flush(&connection)) goto cleanup;
-        if (connection.output.start == connection.output.end) break;
-        struct pollfd ready = { .fd = connection.fd, .events = POLLOUT };
-        if (poll(&ready, 1, 5000) <= 0) goto cleanup;
-    }
-    result = 0;
-
-cleanup:
-    free(command.data);
-    wire_connection_close(&connection);
-    return result;
-}
-
-
 typedef struct {
     GtkApplication *application;
     GtkWindow *window;
@@ -53,6 +23,8 @@ typedef struct {
     GhosttyClipboardLocation pending_clipboard_location;
     bool keys[256];
     guint socket_source;
+    guint write_source;
+    bool failed;
     double scroll_y, momentum_velocity;
     gint64 momentum_last_us;
     guint momentum_tick;
@@ -60,101 +32,48 @@ typedef struct {
     int inflight_scroll_rows;
 } GtkClient;
 
+static void gtk_client_fail(GtkClient *client, const char *message)
+{
+    fprintf(stderr, "gmux: %s\n", message);
+    client->failed = true;
+    g_application_quit(G_APPLICATION(client->application));
+}
+
+static gboolean gtk_socket_writable(gint fd, GIOCondition condition,
+                                    gpointer userdata)
+{
+    (void)fd;
+    GtkClient *client = userdata;
+    if ((condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL))
+        || !wire_flush(&client->connection)) {
+        client->write_source = 0;
+        gtk_client_fail(client, "socket write failed");
+        return G_SOURCE_REMOVE;
+    }
+    if (client->connection.output.start == client->connection.output.end) {
+        client->write_source = 0;
+        return G_SOURCE_REMOVE;
+    }
+    return G_SOURCE_CONTINUE;
+}
+
 static bool gtk_client_send(GtkClient *client, InputKind kind,
                             const void *payload, size_t size)
 {
-    return input_append(&client->input, kind, payload, size)
-        && input_queue(&client->connection, &client->input)
-        && wire_flush(&client->connection);
-}
-
-static bool register_embedded_font(const unsigned char *data, size_t len,
-                                   const char *filename)
-{
-    char *directory = g_build_filename(
-        g_get_user_cache_dir(), "gmux", "fonts", NULL);
-    if (g_mkdir_with_parents(directory, 0700) < 0) {
-        g_free(directory);
+    if (!input_append(&client->input, kind, payload, size)
+        || !input_queue(&client->connection, &client->input)
+        || !wire_flush(&client->connection)) {
+        gtk_client_fail(client, "cannot send terminal input");
         return false;
     }
-    struct stat directory_stat;
-    if (lstat(directory, &directory_stat) < 0
-        || !S_ISDIR(directory_stat.st_mode)
-        || S_ISLNK(directory_stat.st_mode)
-        || directory_stat.st_uid != getuid()
-        || chmod(directory, 0700) < 0) {
-        g_free(directory);
-        return false;
-    }
-    char *path = g_build_filename(directory, filename, NULL);
-    char *temporary = g_build_filename(directory, ".font-XXXXXX", NULL);
-    g_free(directory);
-    int fd = mkstemp(temporary);
-    if (fd < 0) {
-        g_free(path);
-        g_free(temporary);
-        return false;
-    }
-    const unsigned char *cursor = data;
-    size_t remaining = len;
-    while (remaining) {
-        ssize_t written = write(fd, cursor, remaining);
-        if (written > 0) {
-            cursor += written;
-            remaining -= (size_t)written;
-        } else if (written < 0 && errno == EINTR) {
-            continue;
-        } else {
-            close(fd);
-            unlink(temporary);
-            g_free(path);
-            g_free(temporary);
-            return false;
-        }
-    }
-    bool stored = fchmod(fd, 0600) == 0;
-    if (close(fd) < 0) stored = false;
-    if (!stored || rename(temporary, path) < 0) {
-        unlink(temporary);
-        g_free(path);
-        g_free(temporary);
-        return false;
-    }
-    bool ok = FcConfigAppFontAddFile(NULL, (const FcChar8 *)path);
-    g_free(path);
-    g_free(temporary);
-    return ok;
-}
-
-static void gtk_load_config(GtkClient *client)
-{
-    snprintf(client->font_family, sizeof(client->font_family),
-             "Monaspace Argon Frozen");
-    client->font_size = 24;
-    char *path = g_build_filename(g_get_user_config_dir(), "gmux", "config",
-                                  NULL);
-    FILE *file = fopen(path, "r");
-    g_free(path);
-    if (!file) return;
-
-    char line[256];
-    while (fgets(line, sizeof(line), file)) {
-        char *value = strchr(line, '=');
-        if (!value) continue;
-        *value++ = '\0';
-        g_strstrip(line);
-        g_strstrip(value);
-        if (strcmp(line, "font") == 0 && *value) {
-            snprintf(client->font_family, sizeof(client->font_family),
-                     "%s", value);
-        } else if (strcmp(line, "font-size") == 0) {
-            char *end = NULL;
-            long size = strtol(value, &end, 10);
-            if (end != value && *end == '\0' && size >= 6 && size <= 96)
-                client->font_size = (int)size;
-        }
-    }
-    fclose(file);
+    // A full socket is normal. Resume the queued write when it becomes
+    // writable, even if the user never generates another input event.
+    if (!client->write_source
+        && client->connection.output.start < client->connection.output.end)
+        client->write_source = g_unix_fd_add(client->connection.fd,
+            G_IO_OUT | G_IO_HUP | G_IO_ERR | G_IO_NVAL,
+            gtk_socket_writable, client);
+    return true;
 }
 
 static void gtk_apply_font(GtkClient *client)

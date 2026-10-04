@@ -124,8 +124,9 @@ static size_t snapshot_record_count(const RenderSnapshotWire *wire)
 static bool snapshot_pack(const RenderSnapshotWire *wire,
                           msgpack_sbuffer *buffer)
 {
+    WirePacker output = { .buffer = buffer };
     msgpack_packer packer;
-    msgpack_packer_init(&packer, buffer, msgpack_sbuffer_write);
+    msgpack_packer_init(&packer, &output, wire_pack_write);
     msgpack_pack_array(&packer, snapshot_record_count(wire));
     size_t offset = 0;
     while (offset + sizeof(SnapshotRecord) <= wire->len) {
@@ -259,15 +260,22 @@ static bool snapshot_pack(const RenderSnapshotWire *wire,
             msgpack_pack_bin(&packer, clipboard.data_len);
             msgpack_pack_bin_body(&packer, payload + sizeof(clipboard),
                                   clipboard.data_len);
-        } else if (record.kind == SNAPSHOT_PONG && record.size == 0) {
-            msgpack_pack_array(&packer, 1);
+        } else if (record.kind == SNAPSHOT_PONG
+                   && (record.size == 0 || record.size == sizeof(bool))) {
+            msgpack_pack_array(&packer, record.size ? 2 : 1);
             msgpack_pack_uint32(&packer, record.kind);
+            if (record.size) {
+                bool attached;
+                memcpy(&attached, payload, sizeof(attached));
+                attached ? msgpack_pack_true(&packer)
+                         : msgpack_pack_false(&packer);
+            }
         } else {
             return false;
         }
         offset += record.size;
     }
-    return true;
+    return !output.failed && offset == wire->len;
 }
 #endif
 
@@ -278,7 +286,8 @@ static bool snapshot_unpack(const void *data, size_t len,
     msgpack_unpacked unpacked;
     msgpack_unpacked_init(&unpacked);
     size_t offset = 0;
-    if (!msgpack_unpack_next(&unpacked, data, len, &offset)
+    if (msgpack_unpack_next(&unpacked, data, len, &offset)
+            != MSGPACK_UNPACK_SUCCESS
         || offset != len
         || unpacked.data.type != MSGPACK_OBJECT_ARRAY) {
         msgpack_unpacked_destroy(&unpacked);
@@ -313,6 +322,9 @@ static bool snapshot_unpack(const void *data, size_t len,
                 || !object_u64(field[10 + base], &header.scrollbar_len)
                 || !object_u64(field[11 + base], &header.scrollbar_offset))
                 goto fail;
+            if (!rows || rows > UINT16_MAX || !cols || cols > UINT16_MAX
+                || cursor_col > UINT16_MAX || cursor_row > UINT16_MAX)
+                goto fail;
             if (message.via.array.size >= 17
                 && (!unpack_rgb(field[13], &header.selection_background)
                     || !unpack_rgb(field[14], &header.selection_foreground)
@@ -335,6 +347,8 @@ static bool snapshot_unpack(const void *data, size_t len,
                 header.overscan_above = (uint16_t)above;
                 header.overscan_below = (uint16_t)below;
             }
+            if (rows + header.overscan_above + header.overscan_below
+                    > UINT16_MAX) goto fail;
             header.rows = (uint16_t)rows;
             header.cols = (uint16_t)cols;
             header.cursor_col = (uint16_t)cursor_col;
@@ -373,6 +387,7 @@ static bool snapshot_unpack(const void *data, size_t len,
                 uint64_t col;
                 SnapshotCell cell = {0};
                 if (!object_u64(cell_field[0], &col)
+                    || col > UINT16_MAX
                     || !unpack_rgb(cell_field[1], &cell.foreground)
                     || !unpack_rgb(cell_field[2], &cell.background)) goto fail;
                 uint32_t text_index;
@@ -425,9 +440,20 @@ static bool snapshot_unpack(const void *data, size_t len,
             if (!object_i64(field[1], &viewport_col)
                 || !object_i64(field[2], &viewport_row)) goto fail;
             for (int j = 0; j < 10; j++)
-                if (!object_u64(field[j + 3], &value[j])) goto fail;
+                if (!object_u64(field[j + 3], &value[j])
+                    || value[j] > UINT32_MAX) goto fail;
             if (!object_i64(field[13], &layer)
-                || field[14].via.bin.size > UINT32_MAX) goto fail;
+                || viewport_col < INT32_MIN || viewport_col > INT32_MAX
+                || viewport_row < INT32_MIN || viewport_row > INT32_MAX
+                || layer < INT32_MIN || layer > INT32_MAX
+                // Cairo uses signed int dimensions/stride. Bound them before
+                // the renderer allocates or multiplies, and validate RGBA data.
+                || !value[4] || value[4] > INT_MAX / 4
+                || !value[5] || value[5] > INT_MAX
+                || value[4] * value[5] * 4 != field[14].via.bin.size
+                || value[6] > value[4] || value[7] > value[5]
+                || value[8] > value[4] - value[6]
+                || value[9] > value[5] - value[7]) goto fail;
             SnapshotImage image = {
                 .viewport_col = (int32_t)viewport_col,
                 .viewport_row = (int32_t)viewport_row,
@@ -501,6 +527,33 @@ static bool input_queue(WireConnection *connection, InputWire *outgoing)
     msgpack_sbuffer_destroy(&packed);
     return ok;
 }
+
+static int kill_server_process(const char *path)
+{
+    int fd = unix_socket(path, false);
+    if (fd < 0) return 1;
+    WireConnection connection = { .fd = -1 };
+    if (!wire_connection_init(&connection, fd)) {
+        close(fd);
+        return 1;
+    }
+    InputWire input = {0};
+    int result = 1;
+    if (!input_append(&input, INPUT_SHUTDOWN, NULL, 0)
+        || !input_queue(&connection, &input)) goto cleanup;
+    while (connection.output.start < connection.output.end) {
+        if (!wire_flush(&connection)) goto cleanup;
+        if (connection.output.start == connection.output.end) break;
+        struct pollfd ready = { .fd = connection.fd, .events = POLLOUT };
+        if (poll(&ready, 1, 5000) <= 0) goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    free(input.data);
+    wire_connection_close(&connection);
+    return result;
+}
 #endif
 
 #ifdef GMUX_SERVER
@@ -557,6 +610,8 @@ static bool snapshot_style_color(GhosttyStyleColor color,
 static bool snapshot_append(RenderSnapshotWire *wire,
                             const void *data, size_t len)
 {
+    if (!len) return true;
+    if (len > MAX_WIRE_QUEUE - wire->len) return false;
     if (wire->len + len > wire->cap) {
         size_t cap = wire->cap ? wire->cap : 4096;
         while (cap < wire->len + len) cap *= 2;

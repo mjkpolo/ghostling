@@ -14,13 +14,13 @@ set(GMUX_GHOSTTY_SOURCE_DIR "" CACHE PATH
 if (GMUX_BUILD_CLIENT)
   find_package(PkgConfig REQUIRED)
   pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
-  pkg_check_modules(FONTCONFIG REQUIRED IMPORTED_TARGET fontconfig)
 endif()
 
 # --- libghostty-vt -----------------------------------------------------------
 # Virtual terminal emulator library from Ghostty. Requires `zig` on PATH.
 # The Ghostty CMakeLists.txt delegates to `zig build lib-vt` to produce the
-# shared library. See https://ghostty.org/docs/install/build for the
+# static and shared libraries. We link the static target below. See
+# https://ghostty.org/docs/install/build for the
 # required Zig version.
 if (GMUX_BUILD_SERVER)
   # Ghostty's CMake wrapper caches ZIG_EXECUTABLE. Resolve Zig from the active
@@ -50,26 +50,15 @@ set(MSGPACK_ENABLE_SHARED OFF CACHE BOOL "" FORCE)
 set(MSGPACK_ENABLE_STATIC ON CACHE BOOL "" FORCE)
 add_subdirectory(vendor/msgpack-c)
 
-# --- Embed fonts without expanding them into C source ------------------------
-if (GMUX_BUILD_CLIENT)
-enable_language(ASM)
-set(EMBEDDED_FONTS_ASM "${CMAKE_BINARY_DIR}/embedded_fonts.S")
-configure_file(fonts/embedded_fonts.S.in "${EMBEDDED_FONTS_ASM}" @ONLY)
-set_property(SOURCE "${EMBEDDED_FONTS_ASM}" APPEND PROPERTY OBJECT_DEPENDS
-  "${CMAKE_SOURCE_DIR}/fonts/MonaspaceArgonFrozen-Regular.ttf"
-  "${CMAKE_SOURCE_DIR}/fonts/MonaspaceArgonFrozen-Italic.ttf"
-  "${CMAKE_SOURCE_DIR}/fonts/MonaspaceArgonFrozen-Bold.ttf"
-  "${CMAKE_SOURCE_DIR}/fonts/MonaspaceArgonFrozen-BoldItalic.ttf")
-
 # --- Our Project -------------------------------------------------------------
-add_executable(gmux gmux_client.c "${EMBEDDED_FONTS_ASM}")
-target_compile_features(gmux PRIVATE c_std_11)
-target_compile_definitions(gmux PRIVATE GMUX_CLIENT)
-target_include_directories(gmux PRIVATE
-  "${CMAKE_BINARY_DIR}"
-  "${ghostty_SOURCE_DIR}/include"
-)
-target_link_libraries(gmux PkgConfig::GTK4 PkgConfig::FONTCONFIG msgpack-c m)
+if (GMUX_BUILD_CLIENT)
+  add_executable(gmux gmux_client.c)
+  target_compile_features(gmux PRIVATE c_std_11)
+  target_compile_definitions(gmux PRIVATE GMUX_CLIENT)
+  target_include_directories(gmux PRIVATE
+    "${ghostty_SOURCE_DIR}/include"
+  )
+  target_link_libraries(gmux PkgConfig::GTK4 msgpack-c m)
 endif()
 
 if (GMUX_BUILD_SERVER)

@@ -61,12 +61,26 @@ class ReleaseDownloadTest(unittest.TestCase):
 
     def test_explicit_forward_is_not_cleared(self):
         gmuxctl = load_gmuxctl()
-        gmuxctl.SSH_OPTIONS[:] = ["-o", "ClearAllForwardings=yes",
-                                  "-o", "BatchMode=yes"]
-        command = gmuxctl.ssh_forward_command("-L", "a:b", "example")
+        gmuxctl.SSH_CONTROL = "/private/control"
+        command = gmuxctl.control_command("-O", "forward", "-L", "a:b")
         self.assertNotIn("ClearAllForwardings=yes", command)
-        self.assertIn("BatchMode=yes", command)
-        self.assertEqual(command[-3:], ["-L", "a:b", "example"])
+        self.assertEqual(command[1:5], ["-F", "/dev/null", "-S",
+                                       "/private/control"])
+        self.assertEqual(command[-5:], ["-O", "forward", "-L", "a:b", "gmux"])
+
+    def test_cached_client_starts_without_network(self):
+        gmuxctl = load_gmuxctl()
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory)
+            client = cache / "gmux"
+            client.write_bytes(b"cached executable")
+            client.chmod(0o700)
+            with mock.patch.object(gmuxctl, "HERE", cache / "elsewhere"), \
+                    mock.patch.object(gmuxctl.shutil, "which", return_value=None), \
+                    mock.patch.object(gmuxctl, "cache_dir", return_value=cache), \
+                    mock.patch.object(gmuxctl, "release_asset") as download:
+                self.assertEqual(gmuxctl.local_program("gmux"), client)
+                download.assert_not_called()
 
     def test_remote_state_uses_one_ssh_result(self):
         gmuxctl = load_gmuxctl()
@@ -81,6 +95,97 @@ class ReleaseDownloadTest(unittest.TestCase):
         self.assertEqual(state, ("/bin/gmux-server", "/run/user/1/gmux",
                                  "/home/me/.local/share/gmux/terminfo", True))
         run_ssh.assert_called_once()
+
+
+class AttachmentTest(unittest.TestCase):
+    def test_attachments_own_distinct_private_paths_and_cleanup(self):
+        gmuxctl = load_gmuxctl()
+        gmuxctl.SSH_CONTROL = "/private/control"
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(gmuxctl, "local_dir",
+                                  return_value=Path(directory)), \
+                mock.patch.object(gmuxctl.subprocess, "run") as run, \
+                mock.patch.object(gmuxctl.subprocess, "Popen") as launch:
+            first = gmuxctl.start_attachment("host", "/remote", "one", "gmux")
+            second = gmuxctl.start_attachment("host", "/remote", "two", "gmux")
+            self.assertNotEqual(first["directory"].name, second["directory"].name)
+            for attachment in (first, second):
+                self.assertEqual(Path(attachment["directory"].name).stat().st_mode
+                                 & 0o777, 0o700)
+            self.assertEqual(launch.call_count, 2)
+            gmuxctl.stop_attachment(first)
+            self.assertFalse(Path(first["directory"].name).exists())
+            self.assertTrue(Path(second["directory"].name).exists())
+            self.assertIn("cancel", run.call_args.args[0])
+            gmuxctl.stop_attachment(second)
+
+    def test_failed_client_launch_cancels_forward_and_removes_directory(self):
+        gmuxctl = load_gmuxctl()
+        gmuxctl.SSH_CONTROL = "/private/control"
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(gmuxctl, "local_dir",
+                                  return_value=Path(directory)), \
+                mock.patch.object(gmuxctl.subprocess, "run") as run, \
+                mock.patch.object(gmuxctl.subprocess, "Popen",
+                                  side_effect=OSError("no client")):
+            with self.assertRaisesRegex(OSError, "no client"):
+                gmuxctl.start_attachment("host", "/remote", "one", "gmux")
+            self.assertEqual(list(Path(directory).iterdir()), [])
+            self.assertIn("cancel", run.call_args.args[0])
+
+
+class TuiTest(unittest.TestCase):
+    def test_session_attached_elsewhere_does_not_launch_another_window(self):
+        gmuxctl = load_gmuxctl()
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (10, 40)
+        screen.getch.side_effect = [10, ord("q")]
+        with mock.patch.object(gmuxctl.curses, "curs_set"), \
+                mock.patch.object(gmuxctl, "sessions",
+                                  return_value=[("attached", "busy")]), \
+                mock.patch.object(gmuxctl, "start_attachment") as start:
+            gmuxctl.tui(screen, "host", "server", "/remote", "gmux")
+        start.assert_not_called()
+
+    def test_prompt_blocks_and_restores_polling_even_after_error(self):
+        gmuxctl = load_gmuxctl()
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (10, 40)
+        screen.getstr.side_effect = KeyboardInterrupt
+        with mock.patch.object(gmuxctl.curses, "echo"), \
+                mock.patch.object(gmuxctl.curses, "noecho") as noecho:
+            with self.assertRaises(KeyboardInterrupt):
+                gmuxctl.prompt(screen, "Name: ")
+        self.assertEqual(screen.timeout.call_args_list,
+                         [mock.call(-1), mock.call(250)])
+        noecho.assert_called_once()
+
+    def test_long_list_scrolls_and_error_closes_attachments(self):
+        gmuxctl = load_gmuxctl()
+        screen = mock.Mock()
+        screen.getmaxyx.return_value = (10, 40)
+        screen.getch.side_effect = [ord("j")] * 15 + [10, 10, KeyboardInterrupt]
+
+        def draw(row, column, text, limit):
+            self.assertLess(row, 10)
+            self.assertGreaterEqual(row, 0)
+            self.assertLess(limit, 40)
+
+        screen.addnstr.side_effect = draw
+        attachment = {"name": "session-15", "client": mock.Mock()}
+        attachment["client"].poll.return_value = None
+        with mock.patch.object(gmuxctl.curses, "curs_set"), \
+                mock.patch.object(gmuxctl, "sessions", return_value=[
+                    ("live", f"session-{i}") for i in range(30)]), \
+                mock.patch.object(gmuxctl, "start_attachment",
+                                  return_value=attachment) as start, \
+                mock.patch.object(gmuxctl, "stop_attachment") as stop:
+            with self.assertRaises(KeyboardInterrupt):
+                gmuxctl.tui(screen, "host", "server", "/remote", "gmux")
+        start.assert_called_once_with("host", "/remote", "session-15", "gmux")
+        stop.assert_called_once_with(attachment)
+        attachment["client"].terminate.assert_called_once()
+        attachment["client"].wait.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -6,6 +6,12 @@ static bool render_client_resize(RenderClientState *client, uint16_t rows)
     if (rows < client->row_count) {
         for (uint16_t i = rows; i < client->row_count; i++)
             free(client->rows[i].cells);
+        client->row_count = rows;
+        if (!rows) {
+            free(client->rows);
+            client->rows = NULL;
+        }
+        return true;
     }
     CachedRow *next = realloc(client->rows, (size_t)rows * sizeof(*next));
     if (rows && !next)
@@ -34,14 +40,14 @@ static const CachedRow *render_client_row_const(const RenderClientState *client,
         ? &client->rows[index] : NULL;
 }
 
-static void render_client_apply(RenderClientState *client,
+static bool render_client_apply(RenderClientState *client,
                                 const RenderSnapshotWire *wire)
 {
     const SnapshotHeader *header = snapshot_header(wire);
-    if (!header) return;
+    if (!header) return false;
     uint32_t total = (uint32_t)header->rows
         + header->overscan_above + header->overscan_below;
-    if (total > UINT16_MAX) return;
+    if (total > UINT16_MAX) return false;
     if ((client->overscan_above != header->overscan_above
          || client->overscan_below != header->overscan_below)) {
         render_client_resize(client, 0);
@@ -49,7 +55,7 @@ static void render_client_apply(RenderClientState *client,
         client->overscan_below = header->overscan_below;
     }
     if (!render_client_resize(client, (uint16_t)total))
-        return;
+        return false;
     client->header = *header;
 
     size_t offset = 0;
@@ -58,7 +64,7 @@ static void render_client_apply(RenderClientState *client,
         memcpy(&record, wire->data + offset, sizeof(record));
         offset += sizeof(record);
         if (offset + record.size > wire->len)
-            return;
+            return false;
         if (record.kind == SNAPSHOT_ROW && record.size >= sizeof(SnapshotRow)) {
             SnapshotRow row;
             memcpy(&row, wire->data + offset, sizeof(row));
@@ -68,19 +74,19 @@ static void render_client_apply(RenderClientState *client,
             if (cached && expected == record.size) {
                 SnapshotCell *cells = realloc(cached->cells,
                     (size_t)row.cell_count * sizeof(*cells));
-                if (row.cell_count == 0 || cells) {
-                    cached->cells = cells;
-                    cached->cell_count = row.cell_count;
-                    cached->wrapped = row.wrapped;
-                    if (row.cell_count)
-                        memcpy(cached->cells,
-                               wire->data + offset + sizeof(row),
-                               (size_t)row.cell_count * sizeof(*cells));
-                }
+                if (row.cell_count && !cells) return false;
+                cached->cells = cells;
+                cached->cell_count = row.cell_count;
+                cached->wrapped = row.wrapped;
+                if (row.cell_count)
+                    memcpy(cached->cells,
+                           wire->data + offset + sizeof(row),
+                           (size_t)row.cell_count * sizeof(*cells));
             }
         }
         offset += record.size;
     }
+    return true;
 }
 
 static void apply_snapshot_title(GtkWindow *window,
@@ -94,12 +100,12 @@ static void apply_snapshot_title(GtkWindow *window,
         if (offset + record.size > wire->len)
             return;
         if (record.kind == SNAPSHOT_TITLE) {
-            char title[256];
-            size_t len = record.size < sizeof(title) - 1
-                ? record.size : sizeof(title) - 1;
-            memcpy(title, wire->data + offset, len);
-            title[len] = '\0';
-            gtk_window_set_title(window, title);
+            // The server's bounded title may end mid-codepoint. GTK requires
+            // valid UTF-8, including when an application sets arbitrary bytes.
+            char *title = g_utf8_make_valid(
+                (const char *)wire->data + offset, record.size);
+            gtk_window_set_title(window, *title ? title : "gmux");
+            g_free(title);
         }
         offset += record.size;
     }
@@ -125,6 +131,8 @@ static void cairo_cell_decorations(cairo_t *cr, const SnapshotCell *cell,
                                    int cell_width, int cell_height,
                                    double alpha)
 {
+    if (!cell->underline && !cell->strikethrough && !cell->overline)
+        return;
     SnapshotRgb color = cell->has_underline_color
         ? cell->underline_color : cell->foreground;
     cairo_save(cr);
@@ -178,22 +186,30 @@ static bool snapshot_rgb_equal(SnapshotRgb a, SnapshotRgb b)
     return a.r == b.r && a.g == b.g && a.b == b.b;
 }
 
+static void selection_bounds(const ClientSelection *selection,
+                             uint16_t *start_row, uint16_t *start_col,
+                             uint16_t *end_row, uint16_t *end_col)
+{
+    *start_row = selection->start_row;
+    *start_col = selection->start_col;
+    *end_row = selection->end_row;
+    *end_col = selection->end_col;
+    if (*start_row > *end_row
+        || (*start_row == *end_row && *start_col > *end_col)) {
+        uint16_t row = *start_row, col = *start_col;
+        *start_row = *end_row;
+        *start_col = *end_col;
+        *end_row = row;
+        *end_col = col;
+    }
+}
+
 static bool selection_contains_cell(const ClientSelection *selection,
                                     uint16_t row, uint16_t col)
 {
     if (!selection->active) return false;
-    uint16_t start_row = selection->start_row;
-    uint16_t start_col = selection->start_col;
-    uint16_t end_row = selection->end_row;
-    uint16_t end_col = selection->end_col;
-    if (start_row > end_row
-        || (start_row == end_row && start_col > end_col)) {
-        uint16_t swap_row = start_row, swap_col = start_col;
-        start_row = end_row;
-        start_col = end_col;
-        end_row = swap_row;
-        end_col = swap_col;
-    }
+    uint16_t start_row, start_col, end_row, end_col;
+    selection_bounds(selection, &start_row, &start_col, &end_row, &end_col);
     if (row < start_row || row > end_row) return false;
     if (row == start_row && col < start_col) return false;
     if (row == end_row && col > end_col) return false;
@@ -373,11 +389,12 @@ static void cairo_snapshot_images(cairo_t *cr,
                     cairo_surface_t *surface = cairo_image_surface_create_for_data(
                         argb, CAIRO_FORMAT_ARGB32, image.image_w,
                         image.image_h, stride);
-                    double dx = pad + image.viewport_col * cell_width + image.x_offset;
-                    double dy = pad + image.viewport_row * cell_height
+                    double dx = pad + (double)image.viewport_col * cell_width
+                        + image.x_offset;
+                    double dy = pad + (double)image.viewport_row * cell_height
                         + image.y_offset + scroll_y;
-                    double dw = image.grid_cols * cell_width;
-                    double dh = image.grid_rows * cell_height;
+                    double dw = (double)image.grid_cols * cell_width;
+                    double dh = (double)image.grid_rows * cell_height;
                     cairo_save(cr);
                     cairo_rectangle(cr, dx, dy, dw, dh);
                     cairo_clip(cr);
@@ -400,24 +417,6 @@ static void cairo_snapshot_images(cairo_t *cr,
 }
 
 enum { SELECTION_CELL = 1, SELECTION_WORD, SELECTION_LINE };
-
-static void selection_bounds(const ClientSelection *selection,
-                             uint16_t *start_row, uint16_t *start_col,
-                             uint16_t *end_row, uint16_t *end_col)
-{
-    *start_row = selection->start_row;
-    *start_col = selection->start_col;
-    *end_row = selection->end_row;
-    *end_col = selection->end_col;
-    if (*start_row > *end_row
-        || (*start_row == *end_row && *start_col > *end_col)) {
-        uint16_t row = *start_row, col = *start_col;
-        *start_row = *end_row;
-        *start_col = *end_col;
-        *end_row = row;
-        *end_col = col;
-    }
-}
 
 static void cairo_selection(cairo_t *cr, const ClientSelection *selection,
                             const SnapshotHeader *header,

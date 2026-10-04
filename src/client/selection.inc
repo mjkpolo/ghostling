@@ -154,6 +154,7 @@ static void gtk_copy_selection(GtkClient *client)
             && (!cached || !cached->wrapped))
             g_string_append_c(text, '\n');
     }
+    g_clear_pointer(&client->pending_clipboard, g_free);
     gdk_clipboard_set_text(gtk_widget_get_clipboard(client->area), text->str);
     g_string_free(text, TRUE);
 }
@@ -234,7 +235,6 @@ static void gtk_paste_ready(GObject *source, GAsyncResult *result,
                             gpointer userdata)
 {
     GtkClient *client = userdata;
-    gtk_set_pending_clipboard(client);
     GError *error = NULL;
     char *text = gdk_clipboard_read_text_finish(
         GDK_CLIPBOARD(source), result, &error);

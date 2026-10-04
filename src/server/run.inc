@@ -1,5 +1,5 @@
 #ifdef GMUX_SERVER
-static int run_server(int listener_fd)
+static int run_server(int listener_fd, int ready_fd)
 {
     const uint16_t initial_cols = 80, initial_rows = 24;
     const int initial_cell_width = 10, initial_cell_height = 20;
@@ -24,8 +24,11 @@ static int run_server(int listener_fd)
     };
     pid_t child = -1;
     WireConnection connection = { .fd = -1 };
-    int pty_fd = -1, result = 1;
+    WireConnection control = { .fd = -1 };
+    Pty pty = { .fd = -1 };
+    int result = 1;
     bool attached = false, child_exited = false, sent_snapshot = false;
+    bool terminal_changed = false;
     uint32_t scroll_serial = 0;
     uint32_t sent_scroll_serial = 0;
 
@@ -41,12 +44,12 @@ static int run_server(int listener_fd)
         GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &scrollback_max_lines);
     ghostty_terminal_resize(terminal, initial_cols, initial_rows,
                             initial_cell_width, initial_cell_height);
-    pty_fd = pty_spawn(&child, initial_cols, initial_rows,
+    pty.fd = pty_spawn(&child, initial_cols, initial_rows,
                        initial_cell_width, initial_cell_height);
-    if (pty_fd < 0) goto cleanup;
+    if (pty.fd < 0) goto cleanup;
 
     effects = (EffectsContext){
-        .pty_fd = pty_fd,
+        .pty = &pty,
         .cell_width = initial_cell_width,
         .cell_height = initial_cell_height,
         .cols = initial_cols,
@@ -95,32 +98,75 @@ static int run_server(int listener_fd)
     GhosttyRenderStateOverscan overscan = { .above = 8, .below = 8 };
     ghostty_render_state_set(render_state,
         GHOSTTY_RENDER_STATE_OPTION_OVERSCAN, &overscan);
+    if (ready_fd >= 0) {
+        int status = 0;
+        write(ready_fd, &status, sizeof(status));
+        close(ready_fd);
+        ready_fd = -1;
+    }
 
     while (!server_stop) {
         short socket_events = connection.fd >= 0 ? POLLIN : 0;
         if (connection.output.start < connection.output.end)
             socket_events |= POLLOUT;
-        struct pollfd ready[3] = {
-            { .fd = listener_fd, .events = connection.fd < 0 ? POLLIN : 0 },
+        struct pollfd ready[4] = {
+            { .fd = listener_fd,
+              .events = connection.fd < 0 || control.fd < 0 ? POLLIN : 0 },
             { .fd = connection.fd, .events = socket_events },
-            { .fd = pty_fd, .events = child_exited ? 0 : POLLIN },
+            { .fd = child_exited ? -1 : pty.fd,
+              .events = POLLIN | (pty.output.start < pty.output.end
+                                  ? POLLOUT : 0) },
+            { .fd = control.fd,
+              .events = POLLIN | (control.output.start < control.output.end
+                                  ? POLLOUT : 0) },
         };
-        if (poll(ready, 3, -1) < 0) {
+        if (poll(ready, 4, -1) < 0) {
             if (errno == EINTR) continue;
-            break;
+            goto cleanup;
         }
 
-        bool terminal_changed = false, ping_requested = false;
-        if (ready[0].revents & POLLIN) {
-            int client;
-            do client = accept(listener_fd, NULL, NULL);
-            while (client < 0 && errno == EINTR);
-            if (client >= 0) {
-                if (!wire_connection_init(&connection, client))
-                    close(client);
-                attached = false;
-                sent_snapshot = false;
+        bool ping_requested = false;
+        // Keep one control slot available while a GUI is attached. Health and
+        // kill commands must not wait in the listener backlog for it to leave.
+        if (control.fd >= 0 && ready[3].revents) {
+            bool connected = true, ping = false;
+            if (ready[3].revents & (POLLIN | POLLHUP | POLLERR)) {
+                connected = wire_read(&control);
+                for (;;) {
+                    uint8_t *packed = NULL;
+                    size_t packed_len = 0;
+                    int frame = wire_take_frame(&control, &packed, &packed_len);
+                    if (frame == 0) break;
+                    bool valid = frame > 0
+                        && input_decode(packed, packed_len, &input);
+                    free(packed);
+                    if (valid) {
+                        for (size_t offset = 0; offset < input.len;
+                             offset += sizeof(InputRecord)) {
+                            InputRecord record;
+                            memcpy(&record, input.data + offset, sizeof(record));
+                            if (record.size == 0 && record.kind == INPUT_PING)
+                                ping = true;
+                            else if (record.size == 0
+                                     && record.kind == INPUT_SHUTDOWN)
+                                server_stop = 1;
+                            else {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (!valid) { connected = false; break; }
+                }
             }
+            if (connected && ping) {
+                snapshot.len = 0;
+                connected = snapshot_record(&snapshot, SNAPSHOT_PONG,
+                    &attached, sizeof(attached))
+                    && snapshot_queue(&control, &snapshot);
+            }
+            if (connected) connected = wire_flush(&control);
+            if (!connected) wire_connection_close(&control);
         }
 
         if (connection.fd >= 0
@@ -142,7 +188,7 @@ static int run_server(int listener_fd)
                     }
                     free(packed);
                     terminal_changed |= apply_input_wire(
-                        &input, pty_fd, terminal, key_encoder, key_event,
+                        &input, &pty, terminal, key_encoder, key_event,
                         mouse_encoder, mouse_event, &size, &attached,
                         &ping_requested, &scroll_serial);
                     effects.cols = size.cols;
@@ -163,8 +209,9 @@ static int run_server(int listener_fd)
 
         if (connection.fd >= 0 && ping_requested) {
             snapshot.len = 0;
-            snapshot_record(&snapshot, SNAPSHOT_PONG, NULL, 0);
-            if (!snapshot_queue(&connection, &snapshot)
+            if (!snapshot_record(&snapshot, SNAPSHOT_PONG,
+                    &attached, sizeof(attached))
+                || !snapshot_queue(&connection, &snapshot)
                 || !wire_flush(&connection)) {
                 wire_connection_close(&connection);
                 attached = false;
@@ -173,12 +220,44 @@ static int run_server(int listener_fd)
             }
         }
 
-        if (ready[2].revents & (POLLIN | POLLHUP | POLLERR)) {
-            if (pty_read(pty_fd, terminal, &terminal_changed) != PTY_READ_OK)
-                child_exited = true;
+        // Retire disconnected clients before assigning a newly accepted one.
+        // A health check closing as a GUI connects must not put that GUI into
+        // the control-only slot just because both descriptors woke poll().
+        if (ready[0].revents & POLLIN) {
+            int client;
+            do client = accept(listener_fd, NULL, NULL);
+            while (client < 0 && errno == EINTR);
+            if (client >= 0) {
+                WireConnection *slot = connection.fd < 0
+                    ? &connection : &control;
+                if (!wire_connection_init(slot, client))
+                    close(client);
+                if (slot == &connection) {
+                    attached = false;
+                    sent_snapshot = false;
+                }
+            }
         }
 
-        if (terminal_changed && attached) {
+        if (ready[2].revents & (POLLIN | POLLHUP | POLLERR)) {
+            if (pty_read(pty.fd, terminal, &terminal_changed) != PTY_READ_OK) {
+                child_exited = true;
+                close(pty.fd);
+                pty.fd = -1;
+                pty.output.start = pty.output.end = 0;
+            }
+        }
+        if (!child_exited && ready[2].revents & POLLOUT)
+            pty.failed |= !wire_buffer_flush(&pty.output, pty.fd);
+        if (pty.failed) {
+            fprintf(stderr, "gmux: failed to deliver input to PTY\n");
+            goto cleanup;
+        }
+
+        // Parse PTY output continuously, but accumulate dirty rows while the
+        // client is behind. Queue a new snapshot only after the last one drains.
+        if (terminal_changed && attached
+            && connection.output.start == connection.output.end) {
             ghostty_render_state_update(render_state, terminal);
             GhosttyRenderStateDirty dirty = GHOSTTY_RENDER_STATE_DIRTY_FALSE;
             ghostty_render_state_get(render_state,
@@ -192,15 +271,15 @@ static int run_server(int listener_fd)
                     GHOSTTY_TERMINAL_DATA_SCROLLBAR, &scrollbar)
                     == GHOSTTY_SUCCESS;
                 snapshot.len = 0;
-                serialize_render_snapshot(
+                bool snapshot_ok = serialize_render_snapshot(
                     &snapshot, render_state, row_iter, row_cells, dirty,
                     has_scrollbar ? &scrollbar : NULL,
                     terminal, placement_iter, &theme, scroll_serial);
-                if (effects.title_changed)
-                    snapshot_record(&snapshot, SNAPSHOT_TITLE,
+                if (effects.title_changed || (!sent_snapshot && *effects.title))
+                    snapshot_ok &= snapshot_record(&snapshot, SNAPSHOT_TITLE,
                                     effects.title, strlen(effects.title));
                 if (effects.clipboard_changed
-                    && effects.clipboard_len <= UINT32_MAX) {
+                    && effects.clipboard_len <= UINT32_MAX - sizeof(SnapshotClipboard)) {
                     SnapshotClipboard clipboard = {
                         .location = effects.clipboard_location,
                         .data_len = (uint32_t)effects.clipboard_len,
@@ -210,13 +289,13 @@ static int run_server(int listener_fd)
                         (uint32_t)(sizeof(clipboard)
                             + effects.clipboard_len),
                     };
-                    snapshot_append(&snapshot, &record, sizeof(record));
-                    snapshot_append(&snapshot, &clipboard,
+                    snapshot_ok &= snapshot_append(&snapshot, &record, sizeof(record));
+                    snapshot_ok &= snapshot_append(&snapshot, &clipboard,
                                     sizeof(clipboard));
-                    snapshot_append(&snapshot, effects.clipboard_data,
+                    snapshot_ok &= snapshot_append(&snapshot, effects.clipboard_data,
                                     effects.clipboard_len);
                 }
-                if (!snapshot_queue(&connection, &snapshot)
+                if (!snapshot_ok || !snapshot_queue(&connection, &snapshot)
                     || !wire_flush(&connection)) {
                     wire_connection_close(&connection);
                     attached = false;
@@ -228,16 +307,24 @@ static int run_server(int listener_fd)
                 sent_scroll_serial = scroll_serial;
                 sent_snapshot = true;
             }
+            terminal_changed = false;
         }
     }
     result = 0;
 
 cleanup:
+    if (ready_fd >= 0) {
+        int status = EIO;
+        write(ready_fd, &status, sizeof(status));
+        close(ready_fd);
+    }
     free(effects.clipboard_data);
     free(input.data);
     free(snapshot.data);
     wire_connection_close(&connection);
-    if (pty_fd >= 0) close(pty_fd);
+    wire_connection_close(&control);
+    free(pty.output.data);
+    if (pty.fd >= 0) close(pty.fd);
     if (child > 0) {
         if (!child_exited) kill(child, SIGHUP);
         waitpid(child, NULL, 0);
@@ -263,14 +350,11 @@ static int run_server_socket(const char *path, int ready_fd)
         if (ready_fd >= 0) close(ready_fd);
         return 1;
     }
-    int status = 0;
-    if (ready_fd >= 0) write(ready_fd, &status, sizeof(status));
-    if (ready_fd >= 0) close(ready_fd);
     struct sigaction action = { .sa_handler = stop_server };
     sigemptyset(&action.sa_mask);
     sigaction(SIGINT, &action, NULL);
     sigaction(SIGTERM, &action, NULL);
-    int result = run_server(listener);
+    int result = run_server(listener, ready_fd);
     close(listener);
     unlink(path);
     return result;
@@ -278,10 +362,10 @@ static int run_server_socket(const char *path, int ready_fd)
 
 static int daemonize_server(const char *path)
 {
-    char theme[256], theme_path[PATH_MAX];
-    if (server_theme_name(theme, sizeof(theme))
-        && !server_theme_path(theme, theme_path, sizeof(theme_path))) {
-        fprintf(stderr, "gmux theme not found: %s\n", theme);
+    char theme_path[PATH_MAX];
+    if (*gmux_config.theme
+        && !server_theme_path(gmux_config.theme, theme_path, sizeof(theme_path))) {
+        fprintf(stderr, "gmux theme not found: %s\n", gmux_config.theme);
         return 1;
     }
 
@@ -290,6 +374,8 @@ static int daemonize_server(const char *path)
         perror("pipe");
         return 1;
     }
+    fcntl(ready[0], F_SETFD, FD_CLOEXEC);
+    fcntl(ready[1], F_SETFD, FD_CLOEXEC);
 
     pid_t child = fork();
     if (child < 0) {
@@ -338,74 +424,71 @@ static int daemonize_server(const char *path)
     return 0;
 }
 
-static bool health_response(const void *data, size_t len)
+static int health_response(const void *data, size_t len)
 {
     msgpack_unpacked unpacked;
     msgpack_unpacked_init(&unpacked);
     size_t offset = 0;
     bool healthy = msgpack_unpack_next(&unpacked, data, len, &offset)
+            == MSGPACK_UNPACK_SUCCESS
         && offset == len
         && unpacked.data.type == MSGPACK_OBJECT_ARRAY
         && unpacked.data.via.array.size == 1;
+    bool attached = false;
     if (healthy) {
         msgpack_object message = unpacked.data.via.array.ptr[0];
         uint64_t kind = 0;
         healthy = message.type == MSGPACK_OBJECT_ARRAY
-            && message.via.array.size == 1
+            && (message.via.array.size == 1 || message.via.array.size == 2)
             && object_u64(message.via.array.ptr[0], &kind)
-            && kind == SNAPSHOT_PONG;
+            && kind == SNAPSHOT_PONG
+            && (message.via.array.size == 1
+                || object_bool(message.via.array.ptr[1], &attached));
     }
     msgpack_unpacked_destroy(&unpacked);
-    return healthy;
+    return healthy ? (attached ? 2 : 0) : 1;
 }
 
 static int check_server(const char *path)
 {
     int fd = unix_socket(path, false);
-    if (fd < 0) return 1;
+    if (fd < 0) return errno == EAGAIN || errno == EWOULDBLOCK ? 2 : 1;
     WireConnection connection = { .fd = -1 };
     InputWire input = {0};
-    // A successful connect proves that a process still owns the socket. A
-    // pong upgrades that to a responsive gmux server. Exit 2 means the sole
-    // client slot is currently busy, not that the socket is stale.
+    // Exit 2 means busy, never stale. Older servers cannot answer while a GUI
+    // is attached; newer servers include that state in their pong.
     int result = 2;
-    if (!wire_connection_init(&connection, fd)
-        || !input_append(&input, INPUT_PING, NULL, 0)
+    if (!wire_connection_init(&connection, fd)) {
+        close(fd);
+        return 1;
+    }
+    if (!input_append(&input, INPUT_PING, NULL, 0)
         || !input_queue(&connection, &input)
         || !wire_flush(&connection)) goto cleanup;
 
-    struct pollfd ready = { .fd = connection.fd, .events = POLLIN };
-    if (poll(&ready, 1, 1000) <= 0 || !(ready.revents & POLLIN)
-        || !wire_read(&connection)) goto cleanup;
-    uint8_t *packed = NULL;
-    size_t packed_len = 0;
-    if (wire_take_frame(&connection, &packed, &packed_len) == 1
-        && health_response(packed, packed_len)) result = 0;
-    free(packed);
-
-cleanup:
-    free(input.data);
-    wire_connection_close(&connection);
-    return result;
-}
-
-static int kill_server_process(const char *path)
-{
-    int fd = unix_socket(path, false);
-    if (fd < 0) return 1;
-    WireConnection connection = { .fd = -1 };
-    InputWire input = {0};
-    int result = 1;
-    if (!wire_connection_init(&connection, fd)
-        || !input_append(&input, INPUT_SHUTDOWN, NULL, 0)
-        || !input_queue(&connection, &input)) goto cleanup;
-    while (connection.output.start < connection.output.end) {
-        if (!wire_flush(&connection)) goto cleanup;
-        if (connection.output.start == connection.output.end) break;
-        struct pollfd ready = { .fd = connection.fd, .events = POLLOUT };
-        if (poll(&ready, 1, 5000) <= 0) goto cleanup;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t deadline = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000 + 1000;
+    for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t remaining = deadline
+            - ((int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000);
+        if (remaining <= 0) break;
+        struct pollfd ready = { .fd = connection.fd, .events = POLLIN };
+        if (connection.output.start < connection.output.end)
+            ready.events |= POLLOUT;
+        int polled = poll(&ready, 1, (int)remaining);
+        if (polled < 0 && errno == EINTR) continue;
+        if (polled <= 0) break;
+        if ((ready.revents & POLLOUT) && !wire_flush(&connection)) break;
+        bool connected = wire_read(&connection);
+        uint8_t *packed = NULL;
+        size_t packed_len = 0;
+        int frame = wire_take_frame(&connection, &packed, &packed_len);
+        if (frame == 1) result = health_response(packed, packed_len);
+        free(packed);
+        if (frame != 0 || !connected) break;
     }
-    result = 0;
 
 cleanup:
     free(input.data);

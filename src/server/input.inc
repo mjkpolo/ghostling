@@ -1,5 +1,5 @@
 #ifdef GMUX_SERVER
-static void mouse_encode_and_write(int pty_fd, GhosttyMouseEncoder encoder,
+static void mouse_encode_and_write(Pty *pty, GhosttyMouseEncoder encoder,
                                    GhosttyMouseEvent event)
 {
     char buf[128];
@@ -7,10 +7,10 @@ static void mouse_encode_and_write(int pty_fd, GhosttyMouseEncoder encoder,
     GhosttyResult result = ghostty_mouse_encoder_encode(
         encoder, event, buf, sizeof(buf), &written);
     if (result == GHOSTTY_SUCCESS && written > 0)
-        pty_write(pty_fd, buf, written);
+        pty_write(pty, buf, written);
 }
 
-static bool apply_input_wire(InputWire *wire, int pty_fd,
+static bool apply_input_wire(InputWire *wire, Pty *pty,
                              GhosttyTerminal terminal,
                              GhosttyKeyEncoder key_encoder,
                              GhosttyKeyEvent key_event,
@@ -27,7 +27,7 @@ static bool apply_input_wire(InputWire *wire, int pty_fd,
         offset += sizeof(record);
         if (offset + record.size > wire->len)
             break;
-        const uint8_t *payload = wire->data + offset;
+        uint8_t *payload = wire->data + offset;
 
         if (record.kind == INPUT_ATTACH && record.size == 0) {
             *attached = true;
@@ -49,7 +49,7 @@ static bool apply_input_wire(InputWire *wire, int pty_fd,
                 .ws_xpixel = (unsigned short)(size->cols * size->cell_width),
                 .ws_ypixel = (unsigned short)(size->rows * size->cell_height),
             };
-            ioctl(pty_fd, TIOCSWINSZ, &ws);
+            ioctl(pty->fd, TIOCSWINSZ, &ws);
             terminal_changed = true;
         } else if (record.kind == INPUT_KEY
                    && record.size == sizeof(InputKey)) {
@@ -59,7 +59,7 @@ static bool apply_input_wire(InputWire *wire, int pty_fd,
             if (message.key == GHOSTTY_KEY_UNIDENTIFIED) {
                 if (message.text_len > 0
                     && message.text_len <= sizeof(message.text)) {
-                    pty_write(pty_fd, message.text, message.text_len);
+                    pty_write(pty, message.text, message.text_len);
                     encoded = true;
                 }
             } else {
@@ -78,7 +78,7 @@ static bool apply_input_wire(InputWire *wire, int pty_fd,
                 if (ghostty_key_encoder_encode(key_encoder, key_event,
                         buf, sizeof(buf), &written) == GHOSTTY_SUCCESS
                     && written > 0) {
-                    pty_write(pty_fd, buf, written);
+                    pty_write(pty, buf, written);
                     encoded = true;
                 }
             }
@@ -122,7 +122,7 @@ static bool apply_input_wire(InputWire *wire, int pty_fd,
                     int count = message.wheel > 0
                         ? message.wheel : -(int)message.wheel;
                     for (int i = 0; i < count; i++)
-                        pty_write(pty_fd, sequence, 3);
+                        pty_write(pty, sequence, 3);
                 } else {
                     GhosttyTerminalScrollViewport scroll = {
                         .tag = GHOSTTY_SCROLL_VIEWPORT_DELTA,
@@ -167,11 +167,11 @@ static bool apply_input_wire(InputWire *wire, int pty_fd,
                     ghostty_mouse_event_set_button(mouse_event, message.button);
                 else
                     ghostty_mouse_event_clear_button(mouse_event);
-                mouse_encode_and_write(pty_fd, mouse_encoder, mouse_event);
+                mouse_encode_and_write(pty, mouse_encoder, mouse_event);
                 if (message.wheel) {
                     ghostty_mouse_event_set_action(
                         mouse_event, GHOSTTY_MOUSE_ACTION_RELEASE);
-                    mouse_encode_and_write(pty_fd, mouse_encoder, mouse_event);
+                    mouse_encode_and_write(pty, mouse_encoder, mouse_event);
                 }
             }
         } else if (record.kind == INPUT_FOCUS
@@ -188,7 +188,7 @@ static bool apply_input_wire(InputWire *wire, int pty_fd,
                 ghostty_focus_encode(message.focused ? GHOSTTY_FOCUS_GAINED
                                                       : GHOSTTY_FOCUS_LOST,
                                      buf, sizeof(buf), &written);
-                pty_write(pty_fd, buf, written);
+                pty_write(pty, buf, written);
             }
         } else if (record.kind == INPUT_PASTE) {
             bool bracketed = false;
@@ -198,19 +198,26 @@ static bool apply_input_wire(InputWire *wire, int pty_fd,
             if (ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MODE,
                                      &mode) == GHOSTTY_SUCCESS)
                 bracketed = mode.value;
-            char *data = malloc(record.size ? record.size : 1);
-            if (data) {
-                memcpy(data, payload, record.size);
-                size_t encoded_len = 0;
-                GhosttyResult paste_result = ghostty_paste_encode(
-                    data, record.size, bracketed, NULL, 0, &encoded_len);
-                char *encoded = malloc(encoded_len ? encoded_len : 1);
-                if (encoded && paste_result == GHOSTTY_OUT_OF_SPACE
-                    && ghostty_paste_encode(data, record.size, bracketed,
-                        encoded, encoded_len, &encoded_len) == GHOSTTY_SUCCESS)
-                    pty_write(pty_fd, encoded, encoded_len);
+            size_t encoded_len = 0;
+            // The encoder sanitizes in place. This input record is ours and is
+            // discarded after dispatch, so no second copy of the paste is needed.
+            if (ghostty_paste_encode((char *)payload, record.size,
+                    bracketed, NULL, 0, &encoded_len) == GHOSTTY_OUT_OF_SPACE) {
+                char *encoded = malloc(encoded_len);
+                if (!encoded) {
+                    pty->failed = true;
+                } else if (ghostty_paste_encode((char *)payload,
+                        record.size, bracketed, encoded, encoded_len,
+                        &encoded_len) == GHOSTTY_SUCCESS) {
+                    pty_write(pty, encoded, encoded_len);
+                    GhosttyTerminalScrollViewport bottom = {
+                        .tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM,
+                    };
+                    ghostty_terminal_scroll_viewport(terminal, bottom);
+                    *scroll_serial = 0;
+                    terminal_changed = true;
+                }
                 free(encoded);
-                free(data);
             }
         }
         offset += record.size;

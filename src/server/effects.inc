@@ -11,7 +11,7 @@
 // callbacks so they can reach the pty fd (and anything else they need)
 // without global state.
 typedef struct {
-    int pty_fd;
+    Pty *pty;
     int cell_width;
     int cell_height;
     uint16_t cols;
@@ -34,7 +34,7 @@ static void effect_write_pty(GhosttyTerminal terminal, void *userdata,
 {
     (void)terminal;
     EffectsContext *ctx = (EffectsContext *)userdata;
-    pty_write(ctx->pty_fd, (const char *)data, len);
+    pty_write(ctx->pty, (const char *)data, len);
 }
 
 // size effect — responds to XTWINOPS size queries (CSI 14/16/18 t)
@@ -83,7 +83,7 @@ static GhosttyString effect_xtversion(GhosttyTerminal terminal, void *userdata)
 {
     (void)terminal;
     (void)userdata;
-    return (GhosttyString){ .ptr = (const uint8_t *)"ghostling", .len = 9 };
+    return (GhosttyString){ .ptr = (const uint8_t *)"gmux", .len = 4 };
 }
 
 // Record OSC 0 / OSC 2 title changes for the next server snapshot.
@@ -120,6 +120,8 @@ static GhosttyClipboardWriteResult effect_clipboard_write(
         return GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED;
 
     size_t len = text ? text->len : 0;
+    if (len > MAX_WIRE_MESSAGE - sizeof(SnapshotClipboard))
+        return GHOSTTY_CLIPBOARD_WRITE_RESULT_BUSY;
     uint8_t *copy = malloc(len + 1);
     if (!copy) return GHOSTTY_CLIPBOARD_WRITE_RESULT_BUSY;
     if (len) memcpy(copy, text->ptr, len);

@@ -29,17 +29,11 @@
             zigPackage
             pkgs.cmake
             pkgs.ninja
+            pkgs.pkg-config
             pkgs.pinact
             pkgs.scc
           ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
-            pkgs.xorg.libX11
-            pkgs.xorg.libXcursor
-            pkgs.xorg.libXrandr
-            pkgs.xorg.libXinerama
-            pkgs.xorg.libXi
-            pkgs.libGL
-            pkgs.libxkbcommon
-            pkgs.wayland
+            pkgs.gtk4
           ];
 
           # Unset Nix Darwin SDK env vars and remove the xcbuild

@@ -46,10 +46,15 @@ typedef struct {
 
 typedef struct { bool focused; } InputFocus;
 
+#define MAX_WIRE_MESSAGE (128u * 1024u * 1024u)
+#define MAX_WIRE_QUEUE (256u * 1024u * 1024u)
+
 static bool input_append(InputWire *wire, InputKind kind,
                          const void *payload, size_t size)
 {
-    if (size > UINT32_MAX) return false;
+    if (wire->len > MAX_WIRE_QUEUE - sizeof(InputRecord)
+        || size > MAX_WIRE_QUEUE - sizeof(InputRecord) - wire->len)
+        return false;
     size_t needed = wire->len + sizeof(InputRecord) + size;
     if (needed > wire->cap) {
         size_t cap = wire->cap ? wire->cap : 1024;
@@ -69,8 +74,23 @@ static bool input_append(InputWire *wire, InputKind kind,
     return true;
 }
 
-#define MAX_WIRE_MESSAGE (128u * 1024u * 1024u)
-#define MAX_WIRE_QUEUE (256u * 1024u * 1024u)
+// MessagePack's pack calls return allocation errors individually. Remember the
+// first one so a long record cannot accidentally emit a truncated message.
+typedef struct {
+    msgpack_sbuffer *buffer;
+    bool failed;
+} WirePacker;
+
+static int wire_pack_write(void *userdata, const char *data, size_t len)
+{
+    WirePacker *packer = userdata;
+    if (packer->failed || len > MAX_WIRE_MESSAGE - packer->buffer->size
+        || msgpack_sbuffer_write(packer->buffer, data, len) != 0) {
+        packer->failed = true;
+        return -1;
+    }
+    return 0;
+}
 
 typedef struct {
     uint8_t *data;
@@ -133,6 +153,12 @@ static int unix_socket(const char *path, bool server)
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return -1;
+    }
 
     if (server) {
         struct stat existing;
@@ -151,11 +177,13 @@ static int unix_socket(const char *path, bool server)
         if (result < 0 || chmod(path, 0600) < 0 || listen(fd, 1) < 0) {
             int saved = errno;
             close(fd);
-            unlink(path);
+            // A competing bind can win after lstat; never unlink its socket.
+            if (result == 0) unlink(path);
             errno = saved;
             return -1;
         }
-    } else if (connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+    } else if (fcntl(fd, F_SETFL, O_NONBLOCK) < 0
+               || connect(fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         int saved = errno;
         close(fd);
         errno = saved;
@@ -164,11 +192,13 @@ static int unix_socket(const char *path, bool server)
     return fd;
 }
 
-static bool wire_buffer_append(WireBuffer *buffer,
-                               const void *data, size_t len)
+static bool wire_buffer_reserve(WireBuffer *buffer, size_t len)
 {
     size_t used = buffer->end - buffer->start;
-    if (len > MAX_WIRE_QUEUE - used) return false;
+    if (len > MAX_WIRE_QUEUE - used) {
+        errno = ENOBUFS;
+        return false;
+    }
     if (buffer->cap - buffer->end < len && buffer->start) {
         memmove(buffer->data, buffer->data + buffer->start, used);
         buffer->start = 0;
@@ -183,6 +213,14 @@ static bool wire_buffer_append(WireBuffer *buffer,
         buffer->data = next;
         buffer->cap = cap;
     }
+    return true;
+}
+
+static bool wire_buffer_append(WireBuffer *buffer,
+                               const void *data, size_t len)
+{
+    if (!len) return true;
+    if (!wire_buffer_reserve(buffer, len)) return false;
     memcpy(buffer->data + buffer->end, data, len);
     buffer->end += len;
     return true;
@@ -191,7 +229,8 @@ static bool wire_buffer_append(WireBuffer *buffer,
 static bool wire_connection_init(WireConnection *connection, int fd)
 {
     int flags = fcntl(fd, F_GETFL);
-    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0
+        || fcntl(fd, F_SETFD, FD_CLOEXEC) < 0)
         return false;
     *connection = (WireConnection){ .fd = fd };
     return true;
@@ -209,24 +248,9 @@ static bool wire_queue_frame(WireConnection *connection,
                              const void *payload, size_t len)
 {
     WireBuffer *buffer = &connection->output;
-    const size_t frame_len = sizeof(uint32_t) + len;
-    size_t used = buffer->end - buffer->start;
-    if (len > MAX_WIRE_MESSAGE || frame_len > MAX_WIRE_QUEUE - used)
+    if (len > MAX_WIRE_MESSAGE
+        || !wire_buffer_reserve(buffer, sizeof(uint32_t) + len))
         return false;
-    if (buffer->cap - buffer->end < frame_len && buffer->start) {
-        memmove(buffer->data, buffer->data + buffer->start, used);
-        buffer->start = 0;
-        buffer->end = used;
-    }
-    if (buffer->cap - buffer->end < frame_len) {
-        size_t cap = buffer->cap ? buffer->cap : 4096;
-        while (cap < buffer->end + frame_len) cap *= 2;
-        if (cap > MAX_WIRE_QUEUE) cap = MAX_WIRE_QUEUE;
-        void *next = realloc(buffer->data, cap);
-        if (!next) return false;
-        buffer->data = next;
-        buffer->cap = cap;
-    }
     uint32_t network_len = htonl((uint32_t)len);
     memcpy(buffer->data + buffer->end, &network_len, sizeof(network_len));
     buffer->end += sizeof(network_len);
@@ -235,11 +259,10 @@ static bool wire_queue_frame(WireConnection *connection,
     return true;
 }
 
-static bool wire_flush(WireConnection *connection)
+static bool wire_buffer_flush(WireBuffer *buffer, int fd)
 {
-    WireBuffer *buffer = &connection->output;
     while (buffer->start < buffer->end) {
-        ssize_t n = write(connection->fd, buffer->data + buffer->start,
+        ssize_t n = write(fd, buffer->data + buffer->start,
                           buffer->end - buffer->start);
         if (n > 0) buffer->start += (size_t)n;
         else if (n < 0 && errno == EINTR) continue;
@@ -251,15 +274,23 @@ static bool wire_flush(WireConnection *connection)
     return true;
 }
 
+static bool wire_flush(WireConnection *connection)
+{
+    return wire_buffer_flush(&connection->output, connection->fd);
+}
+
 static bool wire_read(WireConnection *connection)
 {
     uint8_t bytes[65536];
-    for (;;) {
+    // Return to dispatch periodically even if a producer is continuously busy.
+    for (size_t received = 0; received < 1024 * 1024;) {
         ssize_t n = read(connection->fd, bytes, sizeof(bytes));
         if (n > 0) {
+            received += (size_t)n;
             if (!wire_buffer_append(&connection->input, bytes, (size_t)n))
                 return false;
         } else if (n == 0) {
+            errno = 0;
             return false;
         } else if (errno == EINTR) {
             continue;
@@ -269,6 +300,7 @@ static bool wire_read(WireConnection *connection)
             return false;
         }
     }
+    return true;
 }
 
 // Returns 1 for a complete frame, 0 when more bytes are needed, and -1 for
@@ -304,7 +336,8 @@ static bool object_u64(msgpack_object object, uint64_t *value)
 
 static bool object_i64(msgpack_object object, int64_t *value)
 {
-    if (object.type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+    if (object.type == MSGPACK_OBJECT_POSITIVE_INTEGER
+        && object.via.u64 <= INT64_MAX) {
         *value = (int64_t)object.via.u64;
         return true;
     }
@@ -351,8 +384,9 @@ static size_t input_record_count(const InputWire *wire)
 
 static bool input_pack(const InputWire *wire, msgpack_sbuffer *buffer)
 {
+    WirePacker output = { .buffer = buffer };
     msgpack_packer packer;
-    msgpack_packer_init(&packer, buffer, msgpack_sbuffer_write);
+    msgpack_packer_init(&packer, &output, wire_pack_write);
     msgpack_pack_array(&packer, input_record_count(wire));
     size_t offset = 0;
     while (offset + sizeof(InputRecord) <= wire->len) {
@@ -382,6 +416,7 @@ static bool input_pack(const InputWire *wire, msgpack_sbuffer *buffer)
                    && record.size == sizeof(InputKey)) {
             InputKey value;
             memcpy(&value, payload, sizeof(value));
+            if (value.text_len > sizeof(value.text)) return false;
             msgpack_pack_array(&packer, 8);
             msgpack_pack_uint32(&packer, record.kind);
             msgpack_pack_uint32(&packer, value.key);
@@ -427,7 +462,7 @@ static bool input_pack(const InputWire *wire, msgpack_sbuffer *buffer)
         }
         offset += record.size;
     }
-    return true;
+    return !output.failed && offset == wire->len;
 }
 #endif
 
@@ -437,7 +472,8 @@ static bool input_unpack(const void *data, size_t len, InputWire *wire)
     msgpack_unpacked unpacked;
     msgpack_unpacked_init(&unpacked);
     size_t offset = 0;
-    if (!msgpack_unpack_next(&unpacked, data, len, &offset)
+    if (msgpack_unpack_next(&unpacked, data, len, &offset)
+            != MSGPACK_UNPACK_SUCCESS
         || offset != len
         || unpacked.data.type != MSGPACK_OBJECT_ARRAY) {
         msgpack_unpacked_destroy(&unpacked);
@@ -459,6 +495,11 @@ static bool input_unpack(const void *data, size_t len, InputWire *wire)
             uint64_t value[7];
             for (int j = 0; j < 7; j++)
                 if (!object_u64(field[j + 1], &value[j])) goto fail;
+            if (!value[0] || value[0] > UINT16_MAX
+                || !value[1] || value[1] > UINT16_MAX
+                || !value[2] || !value[3]) goto fail;
+            for (int j = 2; j < 7; j++)
+                if (value[j] > INT_MAX) goto fail;
             InputResize resize = {
                 (uint16_t)value[0], (uint16_t)value[1],
                 (uint32_t)value[2], (uint32_t)value[3],
@@ -470,11 +511,13 @@ static bool input_unpack(const void *data, size_t len, InputWire *wire)
         } else if (kind == INPUT_KEY && message.via.array.size == 8) {
             uint64_t value[5], text_len;
             for (int j = 0; j < 5; j++)
-                if (!object_u64(field[j + 1], &value[j])) goto fail;
+                if (!object_u64(field[j + 1], &value[j])
+                    || value[j] > UINT32_MAX) goto fail;
             if (field[6].type != MSGPACK_OBJECT_BIN
                 || !object_u64(field[7], &text_len)
                 || text_len != field[6].via.bin.size
-                || text_len > sizeof(((InputKey *)0)->text)) goto fail;
+                || text_len > sizeof(((InputKey *)0)->text)
+                || value[1] > GHOSTTY_KEY_ACTION_REPEAT) goto fail;
             InputKey key = {
                 .key = (GhosttyKey)value[0],
                 .action = (GhosttyKeyAction)value[1],
@@ -499,7 +542,13 @@ static bool input_unpack(const void *data, size_t len, InputWire *wire)
                 || !object_float(field[5], &y)
                 || !object_i64(field[6], &wheel)
                 || !object_bool(field[7], &mouse.has_button)
-                || !object_bool(field[8], &mouse.any_button_pressed)) goto fail;
+                || !object_bool(field[8], &mouse.any_button_pressed)
+                || action > GHOSTTY_MOUSE_ACTION_MOTION
+                || button > GHOSTTY_MOUSE_BUTTON_ELEVEN
+                || mods > UINT32_MAX || wheel < INT8_MIN || wheel > INT8_MAX
+                || !isfinite(x) || !isfinite(y)
+                || x < INT_MIN || x > INT_MAX
+                || y < INT_MIN || y > INT_MAX) goto fail;
             mouse.action = (GhosttyMouseAction)action;
             mouse.button = (GhosttyMouseButton)button;
             mouse.mods = (GhosttyMods)mods;
