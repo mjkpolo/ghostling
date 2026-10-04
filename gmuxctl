@@ -141,7 +141,7 @@ def latest_version():
         if "VERSION" not in release_checksums():
             return None
         version = release_asset("VERSION").read_text().strip()
-        if not re.fullmatch(r"[A-Za-z0-9._-]+", version):
+        if version == "unknown" or not re.fullmatch(r"[A-Za-z0-9._-]+", version):
             raise RuntimeError("invalid release version")
         return version
     except (OSError, RuntimeError) as error:
@@ -189,8 +189,11 @@ printf '%s\n' "$directory"
 def run_ssh(host, script, *args, check=True):
     remote = "sh -s -- " + " ".join(shlex.quote(arg) for arg in args)
     command = ssh_command(host, remote)
-    return subprocess.run(command, input=script, text=True,
-                          capture_output=True, check=check)
+    result = subprocess.run(command, input=script, text=True, capture_output=True)
+    if check and result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip() or "no error output"
+        raise RuntimeError(f"{host}: {detail} (exit {result.returncode})")
+    return result
 
 def provision_terminfo(host, directory=None, checked=False):
     directory_script = r'''

@@ -94,8 +94,10 @@ cd ghostling
 
 The script downloads checksum-verified Zig 0.16.0 into the parent directory of
 the checkout when it is absent. The server embeds libghostty-vt and MessagePack,
-but uses the build system's glibc and libm dynamically. Build on a glibc 2.34
-system to target glibc 2.34.
+but normal local builds use the build system's libc dynamically. For the
+portable x86-64 Linux release server, run `./build.sh --server-musl` instead.
+The output is `build/server-musl/gmux-server`, statically linked with musl
+and compiled for baseline x86-64 CPUs. It needs no installed libc or GTK.
 
 > [!WARNING]
 >
@@ -141,7 +143,10 @@ vendored libraries are the normal build's libraries, not sanitizer rebuilds.
 
 - Every push to `gmux-codex` publishes a GitHub release containing `gmux`,
   `gmux-server`, `gmuxctl`, themes, terminfo, and `SHA256SUMS`. The binaries
-  are built on Rocky Linux 9.4 for a glibc 2.34 baseline. The Actions run also
+  use Rocky Linux 9.4 for the GTK client's glibc 2.34 baseline; the server
+  is fully static musl with baseline x86-64 CPU instructions. CI checks that
+  the server has no dynamic loader or shared-library dependencies and runs
+  its lifecycle tests. The Actions run also
   retains the combined `gmux-rocky-linux-9.4-x86_64` artifact.
 
 Run both binaries directly:

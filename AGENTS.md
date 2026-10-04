@@ -81,8 +81,10 @@
 - `./build.sh` fetches Zig 0.16.0 into `~/codex_projects` when absent and
   builds both binaries. `./build.sh --server-only` skips GTK and builds only
   `gmux-server` for a headless machine.
-- Release CI builds both `gmux` and `gmux-server` on Rocky Linux 9.4 and
-  publishes them together as one artifact.
+- Release CI builds the GTK client on Rocky Linux 9.4 and the server with
+  static musl and baseline x86-64 CPU instructions, publishing both together.
+  `./build.sh --server-musl` reproduces the portable server build in
+  `build/server-musl/`; no system musl installation is needed.
 
 ## Live GUI Testing Under Sway
 

@@ -1,4 +1,4 @@
-name: Build Rocky Linux 9.4 binaries
+name: Build Rocky GTK client and static musl server
 
 permissions:
   contents: write
@@ -26,7 +26,7 @@ jobs:
         run: >-
           dnf -y install cmake file gcc gcc-c++ git
           gtk4-devel make ncurses python3 tar xz
-      - name: Build client and server
+      - name: Build Rocky client and static musl server
         run: |
           set -o pipefail
           ./ci/build-rocky.sh 2>&1 | tee rocky-build.log

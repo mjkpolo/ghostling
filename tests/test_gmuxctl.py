@@ -21,6 +21,23 @@ def load_gmuxctl():
 
 
 class ReleaseDownloadTest(unittest.TestCase):
+    def test_unknown_release_version_does_not_replace_installed_binaries(self):
+        gmuxctl = load_gmuxctl()
+        with mock.patch.object(gmuxctl, "release_checksums", return_value={"VERSION": "hash"}), \
+                mock.patch.object(gmuxctl, "release_asset") as asset, \
+                mock.patch.object(gmuxctl.sys, "stderr", new_callable=io.StringIO) as errors:
+            asset.return_value.read_text.return_value = "unknown\n"
+            self.assertIsNone(gmuxctl.latest_version())
+            self.assertIn("keeping installed binaries", errors.getvalue())
+
+    def test_remote_failure_displays_stderr_instead_of_ssh_argument_list(self):
+        gmuxctl = load_gmuxctl()
+        result = SimpleNamespace(returncode=1, stdout="", stderr="failed to start server: Input/output error\n")
+        with mock.patch.object(gmuxctl.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "hpc: failed to start server: Input/output error"):
+                gmuxctl.run_ssh("hpc", "test command")
+            self.assertIs(gmuxctl.run_ssh("hpc", "test command", check=False), result)
+
     def test_client_versions_skip_current_and_update_old_or_unversioned(self):
         gmuxctl = load_gmuxctl()
         client = Path("/installed/gmux")

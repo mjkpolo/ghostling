@@ -39,7 +39,12 @@ export PATH="$zig_dir:$PATH"
 export ZIG_GLOBAL_CACHE_DIR="$projects_dir/.cache/zig"
 export ZIG_LOCAL_CACHE_DIR="$project_dir/build/.zig-cache"
 
-if [[ "${1:-}" == --server-only ]]; then
+if [[ "${1:-}" == --server-musl ]]; then
+  cmake -S "$project_dir" -B "$project_dir/build/server-musl" \
+    -DCMAKE_TOOLCHAIN_FILE="$project_dir/ci/musl.cmake" \
+    -DCMAKE_BUILD_TYPE=Release -DGMUX_BUILD_CLIENT=OFF -DGMUX_BUILD_SERVER=ON
+  cmake --build "$project_dir/build/server-musl" --target gmux-server
+elif [[ "${1:-}" == --server-only ]]; then
   cmake -S "$project_dir" -B "$project_dir/build" \
     -DCMAKE_BUILD_TYPE=Release -DGMUX_BUILD_CLIENT=OFF -DGMUX_BUILD_SERVER=ON
   cmake --build "$project_dir/build" --target gmux-server

@@ -28,6 +28,12 @@ if (GMUX_BUILD_SERVER)
   find_program(GHOSTLING_ZIG_EXECUTABLE zig REQUIRED NO_CACHE)
   set(ZIG_EXECUTABLE "${GHOSTLING_ZIG_EXECUTABLE}"
       CACHE FILEPATH "Path to the Zig compiler" FORCE)
+  # Zig otherwise specializes libc helpers too for the build host's CPU.
+  # Release runners can have AVX-512 even when the destination server does not.
+  list(APPEND GHOSTTY_ZIG_BUILD_FLAGS "-Dcpu=baseline")
+  list(REMOVE_DUPLICATES GHOSTTY_ZIG_BUILD_FLAGS)
+  set(GHOSTTY_ZIG_BUILD_FLAGS "${GHOSTTY_ZIG_BUILD_FLAGS}" CACHE STRING
+      "Additional flags to pass to zig build" FORCE)
   FetchContent_Declare(ghostty
     GIT_REPOSITORY https://github.com/ghostty-org/ghostty.git
     GIT_TAG befcdfd2c3a1cb24d9ec886e93c95b2b5daa7028
