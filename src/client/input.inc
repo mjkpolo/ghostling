@@ -109,7 +109,9 @@ static void gtk_mouse_click(GtkGestureClick *gesture, int presses,
     if (ghostty_button == GHOSTTY_MOUSE_BUTTON_UNKNOWN) return;
     if (button == 1 && !client->render.header.mouse_tracking) {
         uint16_t row, col;
-        gtk_selection_position(client, x, y, &row, &col);
+        bool boundary = action == GHOSTTY_MOUSE_ACTION_PRESS
+            ? presses == 1 : client->selection.mode == SELECTION_CELL;
+        gtk_selection_position(client, x, y, boundary, &row, &col);
         if (action == GHOSTTY_MOUSE_ACTION_PRESS) {
             client->selection = (ClientSelection){
                 .dragging = true,
@@ -127,10 +129,6 @@ static void gtk_mouse_click(GtkGestureClick *gesture, int presses,
         } else {
             gtk_selection_expand(client, row, col);
             client->selection.dragging = false;
-            if (client->selection.mode == SELECTION_CELL
-                && client->selection.start_row == row
-                && client->selection.start_col == col)
-                client->selection.active = false;
         }
         gtk_widget_queue_draw(client->area);
         return;
@@ -175,11 +173,11 @@ static void gtk_mouse_motion(GtkEventControllerMotion *controller,
     client->mouse_y = y;
     if (!client->render.header.mouse_tracking) {
         if (client->selection.dragging) {
+            uint16_t row, col;
             gtk_selection_position(client, x, y,
-                                   &client->selection.end_row,
-                                   &client->selection.end_col);
-            gtk_selection_expand(client, client->selection.end_row,
-                                 client->selection.end_col);
+                                   client->selection.mode == SELECTION_CELL,
+                                   &row, &col);
+            gtk_selection_expand(client, row, col);
             gtk_widget_queue_draw(client->area);
         }
         return;

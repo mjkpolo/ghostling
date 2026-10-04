@@ -83,6 +83,58 @@ static void test_selection_bounds(void)
     assert(!selection_contains_cell(&selection, 3, 3));
 }
 
+static void test_selection_drag(void)
+{
+    GtkClient client = { .cell_width = 10, .cell_height = 20, .pad = 4 };
+    client.render.header.cols = 8;
+    client.render.header.rows = 3;
+    // Coordinates are relative to the text origin. Includes release at the
+    // original point, both drag directions, row edges, and pointer clamping.
+    const struct {
+        double start_x, start_y, end_x, end_y;
+        int first, last;
+    } cases[] = {
+        {22, 5, 22, 5, -1, -1}, // plain click
+        {21, 5, 24, 5, -1, -1}, // movement within the same half
+        {22, 5, 28, 5, 2, 2},   // one character, forward
+        {28, 5, 22, 5, 2, 2},   // one character, backward
+        {28, 5, 32, 5, -1, -1}, // same edge in neighboring cells
+        {22, 5, 38, 5, 2, 3},
+        {38, 5, 22, 5, 2, 3},
+        {72, 5, 90, 5, 7, 7},   // last column
+        {-10, 5, 8, 5, 0, 0},  // left padding
+        {72, 5, 8, 25, 7, 8},  // across rows
+        {8, 25, 72, 5, 7, 8},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint16_t row, col;
+        gtk_selection_position(&client, cases[i].start_x + client.pad,
+            cases[i].start_y + client.pad, true, &row, &col);
+        client.selection = (ClientSelection){
+            .mode = SELECTION_CELL, .anchor_row = row, .anchor_col = col,
+        };
+        gtk_selection_expand(&client, row, col);
+        assert(!client.selection.active);
+        gtk_selection_position(&client, cases[i].end_x + client.pad,
+            cases[i].end_y + client.pad, true, &row, &col);
+        gtk_selection_expand(&client, row, col);
+        assert(client.selection.active == (cases[i].first >= 0));
+        for (int cell = 0; cell < 24; cell++) {
+            assert(selection_contains_cell(&client.selection, cell / 8, cell % 8)
+                == (cell >= cases[i].first && cell <= cases[i].last));
+        }
+        // Motion and release at the same point must preserve the selection.
+        gtk_selection_expand(&client, row, col);
+        assert(client.selection.active == (cases[i].first >= 0));
+        gtk_selection_expand(&client, client.selection.anchor_row,
+                             client.selection.anchor_col);
+        assert(!client.selection.active);
+    }
+    uint16_t row, col;
+    gtk_selection_position(&client, 32, 9, false, &row, &col);
+    assert(row == 0 && col == 2); // word/line selection does not round
+}
+
 static void test_row_resize(void)
 {
     RenderClientState render = {0};
@@ -130,6 +182,7 @@ int main(void)
     test_queued_paste();
     test_shortcut_release();
     test_selection_bounds();
+    test_selection_drag();
     test_row_resize();
     test_font_fallback();
     puts("client regressions: queued paste, shortcut release, selection, row resize, font fallback passed");

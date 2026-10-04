@@ -87,6 +87,36 @@ static bool snapshot_kitty_images(
     return true;
 }
 
+// Cursor metadata is independent of row dirtiness in libghostty-vt.
+static void snapshot_cursor(GhosttyRenderState state, SnapshotHeader *header)
+{
+    GhosttyRenderStateColors colors = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
+    ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors);
+    header->cursor_color = snapshot_rgb(
+        colors.cursor_has_value ? colors.cursor : colors.foreground);
+    bool in_viewport = false;
+    ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_CURSOR_VISIBLE,
+                             &header->cursor_visible);
+    ghostty_render_state_get(state,
+        GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE, &in_viewport);
+    header->cursor_visible &= in_viewport;
+    if (in_viewport) {
+        ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X,
+                                 &header->cursor_col);
+        ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y,
+                                 &header->cursor_row);
+    }
+}
+
+static bool snapshot_cursor_changed(const SnapshotHeader *a, const SnapshotHeader *b)
+{
+    return a->cursor_col != b->cursor_col || a->cursor_row != b->cursor_row
+        || a->cursor_visible != b->cursor_visible
+        || a->cursor_color.r != b->cursor_color.r
+        || a->cursor_color.g != b->cursor_color.g
+        || a->cursor_color.b != b->cursor_color.b;
+}
+
 static bool serialize_render_snapshot(
     RenderSnapshotWire *wire, GhosttyRenderState render_state,
     GhosttyRenderStateRowIterator row_iter,
@@ -105,8 +135,6 @@ static bool serialize_render_snapshot(
 
     SnapshotHeader header = {
         .background = snapshot_rgb(colors.background),
-        .cursor_color = snapshot_rgb(
-            colors.cursor_has_value ? colors.cursor : colors.foreground),
         .has_selection_background = theme->has_selection_background,
         .has_selection_foreground = theme->has_selection_foreground,
     };
@@ -137,19 +165,7 @@ static bool serialize_render_snapshot(
         header.overscan_below = overscan.below;
     }
 
-    bool cursor_in_viewport = false;
-    ghostty_render_state_get(render_state,
-        GHOSTTY_RENDER_STATE_DATA_CURSOR_VISIBLE, &header.cursor_visible);
-    ghostty_render_state_get(render_state,
-        GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE,
-        &cursor_in_viewport);
-    header.cursor_visible &= cursor_in_viewport;
-    if (header.cursor_visible) {
-        ghostty_render_state_get(render_state,
-            GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X, &header.cursor_col);
-        ghostty_render_state_get(render_state,
-            GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y, &header.cursor_row);
-    }
+    snapshot_cursor(render_state, &header);
     if (scrollbar && scrollbar->total > scrollbar->len) {
         header.scrollbar_visible = true;
         header.scrollbar_total = scrollbar->total;

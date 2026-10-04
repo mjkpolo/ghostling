@@ -2,6 +2,7 @@
 #ifdef GMUX_CLIENT
 
 static void gtk_selection_position(GtkClient *client, double x, double y,
+                                   bool boundary,
                                    uint16_t *row, uint16_t *col)
 {
     if (!client->render.header.rows || !client->render.header.cols) {
@@ -10,11 +11,15 @@ static void gtk_selection_position(GtkClient *client, double x, double y,
     }
     int r = (int)((y - client->pad - client->scroll_y)
                   / client->cell_height);
-    int c = ((int)x - client->pad) / client->cell_width;
+    // Cell drags select between nearest cell edges (as in WezTerm/Kitty).
+    // Word and line selection still need the cell beneath the pointer.
+    int c = (int)floor((x - client->pad) / client->cell_width
+                       + (boundary ? 0.5 : 0));
     if (r < 0) r = 0;
     if (c < 0) c = 0;
     if (r >= client->render.header.rows) r = client->render.header.rows - 1;
-    if (c >= client->render.header.cols) c = client->render.header.cols - 1;
+    int last = client->render.header.cols - (boundary ? 0 : 1);
+    if (c > last) c = last;
     *row = (uint16_t)r;
     *col = (uint16_t)c;
 }
@@ -98,10 +103,20 @@ static void gtk_selection_expand(GtkClient *client, uint16_t row,
             || !gtk_line_at(client, row,
                             &current_first, &current_last)) return;
     } else {
-        selection->end_row = row;
-        selection->end_col = col;
-        selection->active = selection->start_row != row
-            || selection->start_col != col;
+        uint32_t cols = client->render.header.cols;
+        if (!cols) return;
+        uint32_t anchor = selection->anchor_row * cols + selection->anchor_col;
+        uint32_t end = row * cols + col;
+        selection->active = anchor != end;
+        if (!selection->active) return;
+        // Convert edge coordinates to the inclusive cells used by drawing
+        // and copying. Equal edges mean no selection, not a selected cell.
+        uint32_t first = anchor < end ? anchor : end;
+        uint32_t last = (anchor < end ? end : anchor) - 1;
+        selection->start_row = first / cols;
+        selection->start_col = first % cols;
+        selection->end_row = last / cols;
+        selection->end_col = last % cols;
         return;
     }
 

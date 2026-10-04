@@ -33,6 +33,7 @@ static int run_server(int listener_fd, int ready_fd)
     uint32_t scroll_serial = 0;
     uint32_t sent_scroll_serial = 0;
     unsigned sent_config_revision = 0;
+    SnapshotHeader sent_cursor = {0};
 
     signal(SIGPIPE, SIG_IGN);
     ghostty_sys_set(GHOSTTY_SYS_OPT_DECODE_PNG, (const void *)ghostling_decode_png);
@@ -280,7 +281,10 @@ static int run_server(int listener_fd, int ready_fd)
             ghostty_render_state_get(render_state,
                 GHOSTTY_RENDER_STATE_DATA_DIRTY, &dirty);
             if (!sent_snapshot) dirty = GHOSTTY_RENDER_STATE_DIRTY_FULL;
+            SnapshotHeader cursor = {0};
+            snapshot_cursor(render_state, &cursor);
             if (dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE
+                || snapshot_cursor_changed(&cursor, &sent_cursor)
                 || scroll_serial != sent_scroll_serial
                 || sent_config_revision != gmux_config.revision
                 || effects.title_changed || effects.clipboard_changed) {
@@ -336,6 +340,7 @@ static int run_server(int listener_fd, int ready_fd)
                 effects.clipboard_changed = false;
                 sent_scroll_serial = scroll_serial;
                 sent_snapshot = true;
+                sent_cursor = cursor;
                 sent_config_revision = gmux_config.revision;
             }
             terminal_changed = false;

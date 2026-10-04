@@ -268,6 +268,56 @@ static void test_kitty_images(void)
     }
 }
 
+static void test_cursor_only_updates(void)
+{
+    GhosttyTerminal terminal = NULL;
+    GhosttyRenderState state = NULL;
+    GhosttyRenderStateRowIterator rows = NULL;
+    GhosttyRenderStateRowCells cells = NULL;
+    CHECK(ghostty_terminal_new(NULL, &terminal, 80, 24) == GHOSTTY_SUCCESS);
+    CHECK(ghostty_render_state_new(NULL, &state) == GHOSTTY_SUCCESS);
+    CHECK(ghostty_render_state_row_iterator_new(NULL, &rows) == GHOSTTY_SUCCESS);
+    CHECK(ghostty_render_state_row_cells_new(NULL, &cells) == GHOSTTY_SUCCESS);
+    ServerTheme theme = {0};
+    RenderSnapshotWire wire = {0};
+    SnapshotHeader previous = {0};
+    const char *commands[] = {"hello", "\033[D", "\033[B", "\033[?25l", "\033[?25h", "\033]12;#123456\007"};
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        ghostty_terminal_vt_write(terminal, (const uint8_t *)commands[i], strlen(commands[i]));
+        CHECK(ghostty_render_state_update(state, terminal) == GHOSTTY_SUCCESS);
+        GhosttyRenderStateDirty dirty;
+        ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_DIRTY, &dirty);
+        SnapshotHeader cursor = {0};
+        snapshot_cursor(state, &cursor);
+        CHECK(snapshot_cursor_changed(&cursor, &previous));
+        bool cursor_only = i == 1 || i == 3 || i == 4;
+        if (cursor_only) CHECK(dirty == GHOSTTY_RENDER_STATE_DIRTY_FALSE);
+        wire.len = 0;
+        CHECK(serialize_render_snapshot(&wire, state, rows, cells, dirty,
+            NULL, terminal, NULL, &theme, 0));
+        // Movement and hide/show need a header, not retransmitted text rows.
+        if (cursor_only)
+            CHECK(wire.len == sizeof(SnapshotRecord) + sizeof(SnapshotHeader));
+        SnapshotHeader received;
+        memcpy(&received, wire.data + sizeof(SnapshotRecord), sizeof(received));
+        CHECK(!snapshot_cursor_changed(&cursor, &received));
+        CHECK(cursor.cursor_visible == (i != 3));
+        CHECK(cursor.cursor_col == (i == 0 ? 5 : 4));
+        CHECK(cursor.cursor_row == (i < 2 ? 0 : 1));
+        previous = cursor;
+        CHECK(ghostty_render_state_update(state, terminal) == GHOSTTY_SUCCESS);
+        snapshot_cursor(state, &cursor);
+        CHECK(!snapshot_cursor_changed(&cursor, &previous));
+    }
+    CHECK(previous.cursor_color.r == 0x12 && previous.cursor_color.g == 0x34
+          && previous.cursor_color.b == 0x56);
+    free(wire.data);
+    ghostty_render_state_row_cells_free(cells);
+    ghostty_render_state_row_iterator_free(rows);
+    ghostty_render_state_free(state);
+    ghostty_terminal_free(terminal);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -277,6 +327,7 @@ int main(void)
     test_current_snapshot_layout();
     test_graphemes();
     test_kitty_images();
+    test_cursor_only_updates();
     puts("transport: fragmented frames, PTY backpressure, validation, long graphemes, Kitty RGB/RGBA passed");
     return 0;
 }
