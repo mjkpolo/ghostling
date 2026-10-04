@@ -2,6 +2,8 @@ import hashlib
 import importlib.machinery
 import importlib.util
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -58,6 +60,38 @@ class ReleaseDownloadTest(unittest.TestCase):
             gmuxctl.provision_terminfo("example")
         self.assertEqual(run_ssh.call_count, 2)
         download.assert_not_called()
+
+    @unittest.skipUnless(shutil.which("tic") and shutil.which("infocmp"),
+                         "requires ncurses terminfo tools")
+    def test_terminfo_creates_missing_parents_and_skips_existing_entry(self):
+        gmuxctl = load_gmuxctl()
+
+        # Replace only SSH transport: execute the actual provisioning commands
+        # and tic locally, including main()'s pre-discovered-directory path.
+        def local_ssh(host, script, *args, check=True):
+            return subprocess.run(["sh", "-s", "--", *args], input=script,
+                                  text=True, capture_output=True, check=check)
+
+        for checked in (False, True):
+            with self.subTest(checked=checked), \
+                    tempfile.TemporaryDirectory() as temporary, \
+                    mock.patch.object(gmuxctl, "run_ssh", side_effect=local_ssh), \
+                    mock.patch.object(gmuxctl, "ssh_command",
+                                      side_effect=lambda host, command:
+                                      ["sh", "-c", command]) as command:
+                directory = Path(temporary) / "missing parent" / "gmux" / "terminfo"
+                gmuxctl.provision_terminfo("example", str(directory), checked=checked)
+                self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+                entries = list(directory.glob("*/xterm-kitty"))
+                self.assertEqual(len(entries), 1)
+                result = subprocess.run(["infocmp", "-A", str(directory),
+                                         "xterm-kitty"], capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                before = entries[0].stat().st_mtime_ns
+                command.reset_mock()
+                gmuxctl.provision_terminfo("example", str(directory))
+                command.assert_not_called()
+                self.assertEqual(entries[0].stat().st_mtime_ns, before)
 
     def test_explicit_forward_is_not_cleared(self):
         gmuxctl = load_gmuxctl()

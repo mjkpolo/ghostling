@@ -178,7 +178,10 @@ printf '%s\n' "$directory"
     has_tic = run_ssh(host, "command -v tic >/dev/null 2>&1",
                       check=False).returncode == 0
     if has_tic:
-        command = (f"umask 077; tic -x -o {shlex.quote(directory)} "
+        # Discovery returns a path, not an existing directory. tic cannot
+        # create missing parents on a first installation.
+        command = (f"set -eu; umask 077; mkdir -p -- {shlex.quote(directory)}; "
+                   f"tic -x -o {shlex.quote(directory)} "
                    "/dev/stdin")
         subprocess.run(ssh_command(host, command), input=source.read_text(),
                        text=True, check=True)
