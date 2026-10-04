@@ -154,7 +154,6 @@ static void gtk_copy_selection(GtkClient *client)
             && (!cached || !cached->wrapped))
             g_string_append_c(text, '\n');
     }
-    g_clear_pointer(&client->pending_clipboard, g_free);
     gdk_clipboard_set_text(gtk_widget_get_clipboard(client->area), text->str);
     g_string_free(text, TRUE);
 }
@@ -164,17 +163,6 @@ static void gtk_clear_selection(GtkClient *client)
     if (!client->selection.active && !client->selection.dragging) return;
     client->selection = (ClientSelection){0};
     gtk_widget_queue_draw(client->area);
-}
-
-static void gtk_set_pending_clipboard(GtkClient *client)
-{
-    if (!client->pending_clipboard) return;
-    GdkClipboard *clipboard =
-        client->pending_clipboard_location
-            == GHOSTTY_CLIPBOARD_LOCATION_STANDARD
-        ? gtk_widget_get_clipboard(client->area)
-        : gtk_widget_get_primary_clipboard(client->area);
-    gdk_clipboard_set_text(clipboard, client->pending_clipboard);
 }
 
 static bool snapshot_updates_selection(const RenderSnapshotWire *wire,
@@ -220,11 +208,13 @@ static void apply_snapshot_clipboard(GtkClient *client,
                                               + sizeof(clipboard));
             if (sizeof(clipboard) + clipboard.data_len == record.size
                 && g_utf8_validate(data, clipboard.data_len, NULL)) {
-                g_free(client->pending_clipboard);
-                client->pending_clipboard =
-                    g_strndup(data, clipboard.data_len);
-                client->pending_clipboard_location = clipboard.location;
-                gtk_set_pending_clipboard(client);
+                GdkClipboard *target = clipboard.location
+                    == GHOSTTY_CLIPBOARD_LOCATION_STANDARD
+                    ? gtk_widget_get_clipboard(client->area)
+                    : gtk_widget_get_primary_clipboard(client->area);
+                char *text = g_strndup(data, clipboard.data_len);
+                gdk_clipboard_set_text(target, text);
+                g_free(text);
             }
         }
         offset += record.size;

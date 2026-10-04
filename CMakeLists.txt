@@ -51,6 +51,12 @@ set(MSGPACK_ENABLE_STATIC ON CACHE BOOL "" FORCE)
 add_subdirectory(vendor/msgpack-c)
 
 # --- Our Project -------------------------------------------------------------
+# Refresh on every build, but rewrite the header only when the revision changes.
+add_custom_target(gmux-version
+  COMMAND ${CMAKE_COMMAND} -DSOURCE=${CMAKE_SOURCE_DIR}
+    -DOUTPUT=${CMAKE_BINARY_DIR}/gmux_version.h
+    -P ${CMAKE_SOURCE_DIR}/ci/version.cmake
+  BYPRODUCTS ${CMAKE_BINARY_DIR}/gmux_version.h)
 if (GMUX_BUILD_CLIENT)
   add_executable(gmux gmux_client.c)
   target_compile_features(gmux PRIVATE c_std_11)
@@ -81,6 +87,14 @@ if (GMUX_BUILD_SERVER)
 endif()
 
 # The headless server uses forkpty().
+foreach(binary gmux gmux-server)
+  if(TARGET ${binary})
+    add_dependencies(${binary} gmux-version)
+    target_compile_definitions(${binary} PRIVATE GMUX_VERSION_HEADER)
+    target_include_directories(${binary} PRIVATE ${CMAKE_BINARY_DIR})
+  endif()
+endforeach()
+
 if (GMUX_BUILD_SERVER AND UNIX AND NOT APPLE)
   target_link_libraries(gmux-server util m)
 endif()
@@ -95,6 +109,6 @@ if (GMUX_BUILD_SERVER)
           DESTINATION share/gmux/themes)
   install(FILES vendor/iterm2-color-schemes/LICENSE
           DESTINATION share/gmux/themes)
-  install(FILES terminfo/xterm-kitty.terminfo terminfo/KITTY-LICENSE
+  install(FILES terminfo/xterm-ghostty.terminfo terminfo/GHOSTTY-LICENSE
           DESTINATION share/gmux/terminfo)
 endif()

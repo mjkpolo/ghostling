@@ -13,14 +13,14 @@ typedef struct {
     PangoFontDescription *bold_italic;
     char font_family[128];
     int font_size;
+    bool received_config;
+    char last_server_error[4096];
     int cell_width, cell_height;
     int width, height;
     int pad;
     double mouse_x, mouse_y;
     guint mouse_buttons;
     ClientSelection selection;
-    char *pending_clipboard;
-    GhosttyClipboardLocation pending_clipboard_location;
     bool keys[256];
     guint socket_source;
     guint write_source;
@@ -31,6 +31,38 @@ typedef struct {
     uint32_t next_scroll_serial, inflight_scroll_serial;
     int inflight_scroll_rows;
 } GtkClient;
+
+// GtkAlertDialog requires GTK 4.10; Rocky's older GTK needs MessageDialog.
+G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+static void gtk_config_error(GtkClient *client, const char *side, const char *message)
+{
+    char *valid = g_utf8_make_valid(message, -1);
+    GtkWidget *dialog = gtk_message_dialog_new(client->window,
+        GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
+        "%s", side);
+    gtk_window_set_title(GTK_WINDOW(dialog), side);
+    gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog), "%s", valid);
+    g_signal_connect_swapped(dialog, "response", G_CALLBACK(gtk_window_destroy), dialog);
+    gtk_window_present(GTK_WINDOW(dialog));
+    g_free(valid);
+}
+G_GNUC_END_IGNORE_DEPRECATIONS
+
+static bool gtk_font_available(GtkClient *client, const char *configured)
+{
+    // Validate the requested primary family, not the fallback Pango silently
+    // chooses when a name is misspelled. Generic aliases are intentional.
+    char **names = g_strsplit(configured, ",", 2);
+    const char *name = g_strstrip(names[0]);
+    bool found = !g_ascii_strcasecmp(name, "monospace")
+        || !g_ascii_strcasecmp(name, "sans-serif")
+        || !g_ascii_strcasecmp(name, "serif") || !g_ascii_strcasecmp(name, "sans");
+    PangoFontMap *map = pango_context_get_font_map(
+        gtk_widget_get_pango_context(client->area));
+    found = found || pango_font_map_get_family(map, name) != NULL;
+    g_strfreev(names);
+    return found;
+}
 
 static void gtk_client_fail(GtkClient *client, const char *message)
 {
@@ -78,14 +110,20 @@ static bool gtk_client_send(GtkClient *client, InputKind kind,
 
 static void gtk_apply_font(GtkClient *client)
 {
+    // Let Pango try every requested family before our generic fallback.
+    // A missing first family must not discard valid later families.
+    char *family = g_utf8_validate(client->font_family, -1, NULL)
+        ? g_strconcat(client->font_family, ", monospace", NULL)
+        : g_strdup("monospace");
     PangoFontDescription *fonts[] = {
         client->regular, client->italic, client->bold, client->bold_italic,
     };
     for (size_t i = 0; i < sizeof(fonts) / sizeof(fonts[0]); i++) {
-        pango_font_description_set_family(fonts[i], client->font_family);
+        pango_font_description_set_family(fonts[i], family);
         pango_font_description_set_size(fonts[i],
                                         client->font_size * PANGO_SCALE);
     }
+    g_free(family);
     pango_font_description_set_style(client->italic, PANGO_STYLE_ITALIC);
     pango_font_description_set_weight(client->bold, PANGO_WEIGHT_BOLD);
     pango_font_description_set_style(client->bold_italic,
@@ -102,6 +140,48 @@ static void gtk_apply_font(GtkClient *client)
     if (client->cell_height < 1) client->cell_height = 1;
     client->width = client->height = -1;
     gtk_widget_queue_draw(client->area);
+}
+
+static void gtk_apply_config(GtkClient *client)
+{
+    bool saw_config = false, saw_error = false;
+    for (size_t offset = 0; offset + sizeof(SnapshotRecord) <= client->snapshot.len;) {
+        SnapshotRecord record;
+        memcpy(&record, client->snapshot.data + offset, sizeof(record));
+        offset += sizeof(record);
+        if (record.size > client->snapshot.len - offset) break;
+        const void *payload = client->snapshot.data + offset;
+        if (record.kind == SNAPSHOT_CONFIG && record.size == sizeof(SnapshotConfig)) {
+            SnapshotConfig config;
+            memcpy(&config, payload, sizeof(config));
+            saw_config = true;
+            bool font_changed = !client->received_config
+                || strcmp(client->font_family, config.font);
+            if (font_changed && (!g_utf8_validate(config.font, -1, NULL)
+                    || !gtk_font_available(client, config.font))) {
+                char message[PATH_MAX + 256];
+                snprintf(message, sizeof(message), "%s:%u\nfont = %s\n"
+                    "Font is not installed on this client. Using a fallback.",
+                    config.path, config.font_line, config.font);
+                gtk_config_error(client, "CLIENT ERROR", message);
+            }
+            if (font_changed || client->font_size != (int)config.font_size) {
+                snprintf(client->font_family, sizeof(client->font_family), "%s", config.font);
+                client->font_size = (int)config.font_size;
+                gtk_apply_font(client);
+            }
+            client->received_config = true;
+        } else if (record.kind == SNAPSHOT_ERROR) {
+            char *message = g_strndup(payload, record.size);
+            if (strcmp(message, client->last_server_error))
+                gtk_config_error(client, "SERVER ERROR", message);
+            snprintf(client->last_server_error, sizeof(client->last_server_error), "%s", message);
+            g_free(message);
+            saw_error = true;
+        }
+        offset += record.size;
+    }
+    if (saw_config && !saw_error) client->last_server_error[0] = '\0';
 }
 
 static GhosttyMouseButton gtk_mouse_button(guint button)

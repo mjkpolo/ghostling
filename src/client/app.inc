@@ -54,6 +54,7 @@ static gboolean gtk_socket_ready(gint fd, GIOCondition condition,
             free(packed);
             break;
         } else {
+            gtk_apply_config(client);
             const SnapshotHeader *header = snapshot_header(&client->snapshot);
             if (header && client->inflight_scroll_rows
                 && header->scroll_serial
@@ -168,9 +169,10 @@ static int run_client(int socket_fd)
         close(socket_fd);
         return 1;
     }
-    snprintf(client.font_family, sizeof(client.font_family),
-             "%s", gmux_config.font);
-    client.font_size = gmux_config.font_size;
+    // Temporary metrics until the server sends its configuration. Never read
+    // or create a client-side config file.
+    snprintf(client.font_family, sizeof(client.font_family), "monospace");
+    client.font_size = 24;
     client.regular = pango_font_description_new();
     client.italic = pango_font_description_new();
     client.bold = pango_font_description_new();
@@ -188,7 +190,6 @@ static int run_client(int socket_fd)
     render_client_free(&client.render);
     free(client.input.data);
     free(client.snapshot.data);
-    g_free(client.pending_clipboard);
     wire_connection_close(&client.connection);
     pango_font_description_free(client.italic);
     pango_font_description_free(client.regular);

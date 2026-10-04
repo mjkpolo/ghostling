@@ -1,4 +1,5 @@
 import hashlib
+import io
 import importlib.machinery
 import importlib.util
 from pathlib import Path
@@ -20,6 +21,79 @@ def load_gmuxctl():
 
 
 class ReleaseDownloadTest(unittest.TestCase):
+    def test_client_versions_skip_current_and_update_old_or_unversioned(self):
+        gmuxctl = load_gmuxctl()
+        client = Path("/installed/gmux")
+        for output, status, update in (("gmux abc\n", 0, False),
+                                       ("gmux old\n", 0, True),
+                                       ("", 1, True)):
+            with self.subTest(output=output), \
+                    mock.patch.object(gmuxctl.subprocess, "run", return_value=
+                                      SimpleNamespace(stdout=output, returncode=status)), \
+                    mock.patch.object(gmuxctl, "release_asset",
+                                      return_value=Path("/cache/gmux")) as download:
+                result = gmuxctl.update_client(client, "abc")
+                self.assertEqual(result, Path("/cache/gmux") if update else client)
+                self.assertEqual(download.called, update)
+
+    def test_server_update_copies_matching_release_and_themes_only_if_needed(self):
+        gmuxctl = load_gmuxctl()
+        for output, update in (("gmux-server abc\n", False),
+                               ("gmux-server old\n", True), ("", True)):
+            with self.subTest(output=output), \
+                    mock.patch.object(gmuxctl, "run_ssh", return_value=
+                                      SimpleNamespace(stdout=output, returncode=0)), \
+                    mock.patch.object(gmuxctl, "release_asset",
+                                      return_value=Path("/cache/gmux-server")), \
+                    mock.patch.object(gmuxctl, "copy_server") as copy:
+                gmuxctl.update_server("host", "/remote/bin/gmux-server", "abc")
+                if update:
+                    copy.assert_called_once_with("host", Path("/cache/gmux-server"),
+                                                 "/remote/bin", release_themes=True)
+                else:
+                    copy.assert_not_called()
+
+    def test_unavailable_version_check_keeps_installed_binaries(self):
+        gmuxctl = load_gmuxctl()
+        with mock.patch.object(gmuxctl, "release_checksums",
+                               side_effect=RuntimeError("offline")), \
+                mock.patch("builtins.print"):
+            self.assertIsNone(gmuxctl.latest_version())
+
+    def test_server_copy_includes_themes_and_repairs_missing_bundle(self):
+        gmuxctl = load_gmuxctl()
+
+        def local_ssh(host, script, *args, check=True):
+            return subprocess.run(["sh", "-s", "--", *args], input=script,
+                                  text=True, capture_output=True, check=check)
+
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(gmuxctl, "remote_config_dir",
+                                  return_value=str(Path(temporary) / "config")), \
+                mock.patch.object(gmuxctl, "run_ssh", side_effect=local_ssh), \
+                mock.patch.object(gmuxctl, "ssh_command",
+                                  side_effect=lambda host, command:
+                                  ["sh", "-c", command]) as command:
+            root = Path(temporary)
+            (root / "config").mkdir()
+            source = root / "source"
+            source.mkdir()
+            binary = source / "gmux-server"
+            binary.write_bytes(b"test binary")
+            (source / "themes").mkdir()
+            (source / "themes/LICENSE").write_text("test license")
+            (source / "themes/Test Theme").write_text("background = 123456\n")
+            server = gmuxctl.copy_server("example", binary, str(root / "remote bin"))
+            themes = root / "config/themes"
+            self.assertEqual((themes / "Test Theme").read_text(),
+                             "background = 123456\n")
+            command.reset_mock()
+            gmuxctl.provision_themes("example", binary)
+            command.assert_not_called()
+            shutil.rmtree(themes)
+            gmuxctl.provision_themes("example", binary)
+            self.assertTrue((themes / "Test Theme").is_file())
+
     def test_download_is_verified_and_cached(self):
         gmuxctl = load_gmuxctl()
         with tempfile.TemporaryDirectory() as release_temp:
@@ -47,6 +121,24 @@ class ReleaseDownloadTest(unittest.TestCase):
                         gmuxctl.release_asset("gmux", executable=True),
                         downloaded)
                     output.assert_not_called()
+
+    def test_checksum_redirect_does_not_change_asset_endpoint(self):
+        gmuxctl = load_gmuxctl()
+        payload = b"published gmux binary\n"
+        digest = hashlib.sha256(payload).hexdigest()
+        checksums = io.BytesIO(f"{digest}  gmux\n".encode())
+        checksums.geturl = lambda: (
+            "https://release-assets.githubusercontent.com/123/checksum-object?signature=abc")
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(gmuxctl, "cache_dir", return_value=Path(temporary)), \
+                mock.patch.object(gmuxctl, "urlopen",
+                                  side_effect=[checksums, io.BytesIO(payload)]) as download, \
+                mock.patch("builtins.print"):
+            self.assertEqual(gmuxctl.release_asset("gmux").read_bytes(), payload)
+        self.assertEqual(download.call_args_list, [
+            mock.call(f"{gmuxctl.RELEASE_BASE}/SHA256SUMS", timeout=5),
+            mock.call(f"{gmuxctl.RELEASE_BASE}/gmux", timeout=60),
+        ])
 
     def test_existing_remote_terminfo_is_not_copied(self):
         gmuxctl = load_gmuxctl()
@@ -80,12 +172,17 @@ class ReleaseDownloadTest(unittest.TestCase):
                                       side_effect=lambda host, command:
                                       ["sh", "-c", command]) as command:
                 directory = Path(temporary) / "missing parent" / "gmux" / "terminfo"
+                # An old Kitty entry must not make Ghostty provisioning skip.
+                if not checked:
+                    directory.mkdir(parents=True, mode=0o700)
+                    (directory / "x").mkdir(mode=0o700)
+                    (directory / "x/xterm-kitty").write_bytes(b"old entry")
                 gmuxctl.provision_terminfo("example", str(directory), checked=checked)
                 self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
-                entries = list(directory.glob("*/xterm-kitty"))
+                entries = list(directory.glob("*/xterm-ghostty"))
                 self.assertEqual(len(entries), 1)
                 result = subprocess.run(["infocmp", "-A", str(directory),
-                                         "xterm-kitty"], capture_output=True)
+                                         "xterm-ghostty"], capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 before = entries[0].stat().st_mtime_ns
                 command.reset_mock()

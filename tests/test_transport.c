@@ -198,6 +198,38 @@ static void test_graphemes(void)
     ghostty_terminal_free(terminal);
 }
 
+static void test_current_snapshot_layout(void)
+{
+    RenderSnapshotWire wire = {0}, decoded = {0};
+    SnapshotHeader header = {
+        .rows = 24, .cols = 80, .cursor_visible = true,
+        .mouse_tracking = true, .overscan_above = 2, .overscan_below = 3,
+        .has_selection_background = true,
+        .selection_background = {10, 20, 30},
+    };
+    SnapshotRow row = { .row = -1, .cell_count = 1, .wrapped = true };
+    SnapshotCell cell = {
+        .col = 4, .text = "hello", .has_text = true,
+        .bold = true, .italic = true, .wide = 1,
+    };
+    SnapshotRecord record = { SNAPSHOT_ROW, sizeof(row) + sizeof(cell) };
+    CHECK(snapshot_record(&wire, SNAPSHOT_HEADER, &header, sizeof(header)));
+    CHECK(snapshot_append(&wire, &record, sizeof(record)));
+    CHECK(snapshot_append(&wire, &row, sizeof(row)));
+    CHECK(snapshot_append(&wire, &cell, sizeof(cell)));
+    msgpack_sbuffer packed;
+    msgpack_sbuffer_init(&packed);
+    CHECK(snapshot_pack(&wire, &packed));
+    CHECK(snapshot_decode(packed.data, packed.size, &decoded));
+    CHECK(decoded.len == wire.len && memcmp(decoded.data, wire.data, wire.len) == 0);
+    msgpack_sbuffer_destroy(&packed);
+    // The obsolete row layout omitted wrapped; only the current layout is valid.
+    const uint8_t old_row[] = {0x91, 0x93, SNAPSHOT_ROW, 0, 0x90};
+    CHECK(!snapshot_decode(old_row, sizeof(old_row), &decoded));
+    free(wire.data);
+    free(decoded.data);
+}
+
 static void test_kitty_images(void)
 {
     const char *commands[] = {
@@ -242,6 +274,7 @@ int main(void)
     test_socket_backpressure();
     test_pty_backpressure();
     test_validation();
+    test_current_snapshot_layout();
     test_graphemes();
     test_kitty_images();
     puts("transport: fragmented frames, PTY backpressure, validation, long graphemes, Kitty RGB/RGBA passed");

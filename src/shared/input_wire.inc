@@ -14,6 +14,7 @@ typedef enum {
     INPUT_SHUTDOWN,
     INPUT_PASTE,
     INPUT_PING,
+    INPUT_FONT_DELTA,
 } InputKind;
 
 typedef struct { uint32_t kind, size; } InputRecord;
@@ -229,8 +230,7 @@ static bool wire_buffer_append(WireBuffer *buffer,
 static bool wire_connection_init(WireConnection *connection, int fd)
 {
     int flags = fcntl(fd, F_GETFL);
-    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0
-        || fcntl(fd, F_SETFD, FD_CLOEXEC) < 0)
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
         return false;
     *connection = (WireConnection){ .fd = fd };
     return true;
@@ -452,6 +452,10 @@ static bool input_pack(const InputWire *wire, msgpack_sbuffer *buffer)
             msgpack_pack_uint32(&packer, record.kind);
             value.focused ? msgpack_pack_true(&packer)
                           : msgpack_pack_false(&packer);
+        } else if (record.kind == INPUT_FONT_DELTA && record.size == sizeof(int8_t)) {
+            msgpack_pack_array(&packer, 2);
+            msgpack_pack_uint32(&packer, record.kind);
+            msgpack_pack_int8(&packer, *(const int8_t *)payload);
         } else if (record.kind == INPUT_PASTE) {
             msgpack_pack_array(&packer, 2);
             msgpack_pack_uint32(&packer, record.kind);
@@ -462,7 +466,7 @@ static bool input_pack(const InputWire *wire, msgpack_sbuffer *buffer)
         }
         offset += record.size;
     }
-    return !output.failed && offset == wire->len;
+    return !output.failed;
 }
 #endif
 
@@ -568,6 +572,11 @@ static bool input_unpack(const void *data, size_t len, InputWire *wire)
             if (!object_bool(field[1], &focus.focused)
                 || !input_append(wire, INPUT_FOCUS, &focus, sizeof(focus)))
                 goto fail;
+        } else if (kind == INPUT_FONT_DELTA && message.via.array.size == 2) {
+            int64_t delta;
+            if (!object_i64(field[1], &delta) || (delta != -1 && delta != 1)) goto fail;
+            int8_t value = (int8_t)delta;
+            if (!input_append(wire, INPUT_FONT_DELTA, &value, sizeof(value))) goto fail;
         } else if (kind == INPUT_PASTE && message.via.array.size == 2
                    && field[1].type == MSGPACK_OBJECT_BIN) {
             if (!input_append(wire, INPUT_PASTE, field[1].via.bin.ptr,

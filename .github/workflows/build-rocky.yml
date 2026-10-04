@@ -55,7 +55,8 @@ jobs:
             artifacts/gmux-server
             artifacts/gmuxctl
             artifacts/gmux-themes.tar.gz
-            artifacts/xterm-kitty.terminfo
-            artifacts/KITTY-LICENSE
+            artifacts/xterm-ghostty.terminfo
+            artifacts/GHOSTTY-LICENSE
             artifacts/SHA256SUMS
+            artifacts/VERSION
             artifacts/dependencies.txt

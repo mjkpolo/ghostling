@@ -50,12 +50,18 @@ int main(void)
     assert(memcmp(actual, custom, read) == 0);
     fclose(file);
 
-    // Relative XDG paths are ignored, consistently on client and server.
+    file = fopen(path, "w");
+    assert(file);
+    fclose(file);
+    gmux_load_config();
+    assert(!*gmux_config.theme && gmux_config.font_size == 24);
+
+    // Use the configured XDG path as-is, like Ghostty and WezTerm.
     result = setenv("XDG_CONFIG_HOME", "relative-path", 1);
     assert(result == 0);
     char resolved[PATH_MAX], expected[PATH_MAX];
     bool found = gmux_config_dir(resolved, sizeof(resolved));
-    snprintf(expected, sizeof(expected), "%s/.config/gmux", directory);
+    snprintf(expected, sizeof(expected), "relative-path/gmux");
     assert(found && strcmp(resolved, expected) == 0);
     unlink(path);
     snprintf(path, sizeof(path), "%s/gmux", directory);

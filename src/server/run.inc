@@ -27,10 +27,12 @@ static int run_server(int listener_fd, int ready_fd)
     WireConnection control = { .fd = -1 };
     Pty pty = { .fd = -1 };
     int result = 1;
+    int config_fd = -1;
     bool attached = false, child_exited = false, sent_snapshot = false;
     bool terminal_changed = false;
     uint32_t scroll_serial = 0;
     uint32_t sent_scroll_serial = 0;
+    unsigned sent_config_revision = 0;
 
     signal(SIGPIPE, SIG_IGN);
     ghostty_sys_set(GHOSTTY_SYS_OPT_DECODE_PNG, (const void *)ghostling_decode_png);
@@ -98,6 +100,8 @@ static int run_server(int listener_fd, int ready_fd)
     GhosttyRenderStateOverscan overscan = { .above = 8, .below = 8 };
     ghostty_render_state_set(render_state,
         GHOSTTY_RENDER_STATE_OPTION_OVERSCAN, &overscan);
+    config_fd = server_config_watch();
+    if (config_fd < 0) perror("watch gmux config");
     if (ready_fd >= 0) {
         int status = 0;
         write(ready_fd, &status, sizeof(status));
@@ -109,7 +113,7 @@ static int run_server(int listener_fd, int ready_fd)
         short socket_events = connection.fd >= 0 ? POLLIN : 0;
         if (connection.output.start < connection.output.end)
             socket_events |= POLLOUT;
-        struct pollfd ready[4] = {
+        struct pollfd ready[5] = {
             { .fd = listener_fd,
               .events = connection.fd < 0 || control.fd < 0 ? POLLIN : 0 },
             { .fd = connection.fd, .events = socket_events },
@@ -119,10 +123,26 @@ static int run_server(int listener_fd, int ready_fd)
             { .fd = control.fd,
               .events = POLLIN | (control.output.start < control.output.end
                                   ? POLLOUT : 0) },
+            { .fd = config_fd, .events = POLLIN },
         };
-        if (poll(ready, 4, -1) < 0) {
+        if (poll(ready, 5, -1) < 0) {
             if (errno == EINTR) continue;
-            goto cleanup;
+            break;
+        }
+
+        if (ready[4].revents & POLLIN && server_config_changed(config_fd)) {
+            gmux_load_config();
+            terminal_changed = true;
+            ServerTheme next = {0};
+            // A temporarily missing theme must not destroy the active one.
+            if (!*gmux_config.theme || server_theme_load(&next)) {
+                theme = next;
+                server_theme_apply(terminal, &theme);
+                effects.color_scheme = !theme.has_background
+                    || ghostty_color_perceived_luminance(&theme.background) <= 0.5
+                    ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT;
+                sent_snapshot = false;
+            }
         }
 
         bool ping_requested = false;
@@ -254,10 +274,7 @@ static int run_server(int listener_fd, int ready_fd)
             goto cleanup;
         }
 
-        // Parse PTY output continuously, but accumulate dirty rows while the
-        // client is behind. Queue a new snapshot only after the last one drains.
-        if (terminal_changed && attached
-            && connection.output.start == connection.output.end) {
+        if (terminal_changed && attached) {
             ghostty_render_state_update(render_state, terminal);
             GhosttyRenderStateDirty dirty = GHOSTTY_RENDER_STATE_DIRTY_FALSE;
             ghostty_render_state_get(render_state,
@@ -265,6 +282,7 @@ static int run_server(int listener_fd, int ready_fd)
             if (!sent_snapshot) dirty = GHOSTTY_RENDER_STATE_DIRTY_FULL;
             if (dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE
                 || scroll_serial != sent_scroll_serial
+                || sent_config_revision != gmux_config.revision
                 || effects.title_changed || effects.clipboard_changed) {
                 GhosttyTerminalScrollbar scrollbar = {0};
                 bool has_scrollbar = ghostty_terminal_get(terminal,
@@ -275,11 +293,23 @@ static int run_server(int listener_fd, int ready_fd)
                     &snapshot, render_state, row_iter, row_cells, dirty,
                     has_scrollbar ? &scrollbar : NULL,
                     terminal, placement_iter, &theme, scroll_serial);
+                if (!sent_snapshot || sent_config_revision != gmux_config.revision) {
+                    SnapshotConfig config = {
+                        .font_size = (uint32_t)gmux_config.font_size,
+                        .font_line = gmux_config.font_line,
+                    };
+                    snprintf(config.font, sizeof(config.font), "%s", gmux_config.font);
+                    snprintf(config.path, sizeof(config.path), "%s", gmux_config.path);
+                    snapshot_ok &= snapshot_record(&snapshot, SNAPSHOT_CONFIG,
+                                                    &config, sizeof(config));
+                    if (*gmux_config.error)
+                        snapshot_ok &= snapshot_record(&snapshot, SNAPSHOT_ERROR,
+                            gmux_config.error, strlen(gmux_config.error));
+                }
                 if (effects.title_changed || (!sent_snapshot && *effects.title))
                     snapshot_ok &= snapshot_record(&snapshot, SNAPSHOT_TITLE,
                                     effects.title, strlen(effects.title));
-                if (effects.clipboard_changed
-                    && effects.clipboard_len <= UINT32_MAX - sizeof(SnapshotClipboard)) {
+                if (effects.clipboard_changed) {
                     SnapshotClipboard clipboard = {
                         .location = effects.clipboard_location,
                         .data_len = (uint32_t)effects.clipboard_len,
@@ -306,6 +336,7 @@ static int run_server(int listener_fd, int ready_fd)
                 effects.clipboard_changed = false;
                 sent_scroll_serial = scroll_serial;
                 sent_snapshot = true;
+                sent_config_revision = gmux_config.revision;
             }
             terminal_changed = false;
         }
@@ -313,6 +344,7 @@ static int run_server(int listener_fd, int ready_fd)
     result = 0;
 
 cleanup:
+    if (config_fd >= 0) close(config_fd);
     if (ready_fd >= 0) {
         int status = EIO;
         write(ready_fd, &status, sizeof(status));
@@ -362,13 +394,6 @@ static int run_server_socket(const char *path, int ready_fd)
 
 static int daemonize_server(const char *path)
 {
-    char theme_path[PATH_MAX];
-    if (*gmux_config.theme
-        && !server_theme_path(gmux_config.theme, theme_path, sizeof(theme_path))) {
-        fprintf(stderr, "gmux theme not found: %s\n", gmux_config.theme);
-        return 1;
-    }
-
     int ready[2];
     if (pipe(ready) < 0) {
         perror("pipe");
@@ -452,7 +477,7 @@ static int health_response(const void *data, size_t len)
 static int check_server(const char *path)
 {
     int fd = unix_socket(path, false);
-    if (fd < 0) return errno == EAGAIN || errno == EWOULDBLOCK ? 2 : 1;
+    if (fd < 0) return errno == EAGAIN ? 2 : 1;
     WireConnection connection = { .fd = -1 };
     InputWire input = {0};
     // Exit 2 means busy, never stale. Older servers cannot answer while a GUI

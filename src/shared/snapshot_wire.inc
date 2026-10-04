@@ -8,7 +8,13 @@ typedef enum {
     SNAPSHOT_TITLE = 4,
     SNAPSHOT_CLIPBOARD = 5,
     SNAPSHOT_PONG = 6,
+    SNAPSHOT_CONFIG,
+    SNAPSHOT_ERROR,
 } SnapshotRecordKind;
+typedef struct {
+    char font[128], path[PATH_MAX];
+    uint32_t font_size, font_line;
+} SnapshotConfig;
 typedef struct { uint32_t kind, size; } SnapshotRecord;
 typedef struct { uint8_t r, g, b; } SnapshotRgb;
 typedef struct {
@@ -243,7 +249,18 @@ static bool snapshot_pack(const RenderSnapshotWire *wire,
             msgpack_pack_bin(&packer, image.pixel_len);
             msgpack_pack_bin_body(&packer, payload + sizeof(image),
                                   image.pixel_len);
-        } else if (record.kind == SNAPSHOT_TITLE) {
+        } else if (record.kind == SNAPSHOT_CONFIG && record.size == sizeof(SnapshotConfig)) {
+            SnapshotConfig config;
+            memcpy(&config, payload, sizeof(config));
+            msgpack_pack_array(&packer, 5);
+            msgpack_pack_uint32(&packer, record.kind);
+            msgpack_pack_str(&packer, strlen(config.font));
+            msgpack_pack_str_body(&packer, config.font, strlen(config.font));
+            msgpack_pack_uint32(&packer, config.font_size);
+            msgpack_pack_uint32(&packer, config.font_line);
+            msgpack_pack_str(&packer, strlen(config.path));
+            msgpack_pack_str_body(&packer, config.path, strlen(config.path));
+        } else if (record.kind == SNAPSHOT_TITLE || record.kind == SNAPSHOT_ERROR) {
             msgpack_pack_array(&packer, 2);
             msgpack_pack_uint32(&packer, record.kind);
             msgpack_pack_str(&packer, record.size);
@@ -275,7 +292,7 @@ static bool snapshot_pack(const RenderSnapshotWire *wire,
         }
         offset += record.size;
     }
-    return !output.failed && offset == wire->len;
+    return !output.failed;
 }
 #endif
 
@@ -301,52 +318,42 @@ static bool snapshot_unpack(const void *data, size_t len,
         msgpack_object *field = message.via.array.ptr;
         uint64_t kind;
         if (!object_u64(field[0], &kind)) goto fail;
-        if (kind == SNAPSHOT_HEADER
-            && (message.via.array.size == 12
-                || message.via.array.size == 13
-                || message.via.array.size == 17
-                || message.via.array.size == 22)) {
+        if (kind == SNAPSHOT_HEADER && message.via.array.size == 22) {
             uint64_t rows, cols, cursor_col, cursor_row;
             SnapshotHeader header = {0};
-            uint32_t base = message.via.array.size == 12 ? 0 : 1;
             if (!object_u64(field[1], &rows)
                 || !object_u64(field[2], &cols)
                 || !unpack_rgb(field[3], &header.background)
-                || (base && !object_bool(field[4], &header.mouse_tracking))
-                || !object_bool(field[4 + base], &header.cursor_visible)
-                || !object_u64(field[5 + base], &cursor_col)
-                || !object_u64(field[6 + base], &cursor_row)
-                || !unpack_rgb(field[7 + base], &header.cursor_color)
-                || !object_bool(field[8 + base], &header.scrollbar_visible)
-                || !object_u64(field[9 + base], &header.scrollbar_total)
-                || !object_u64(field[10 + base], &header.scrollbar_len)
-                || !object_u64(field[11 + base], &header.scrollbar_offset))
+                || !object_bool(field[4], &header.mouse_tracking)
+                || !object_bool(field[5], &header.cursor_visible)
+                || !object_u64(field[6], &cursor_col)
+                || !object_u64(field[7], &cursor_row)
+                || !unpack_rgb(field[8], &header.cursor_color)
+                || !object_bool(field[9], &header.scrollbar_visible)
+                || !object_u64(field[10], &header.scrollbar_total)
+                || !object_u64(field[11], &header.scrollbar_len)
+                || !object_u64(field[12], &header.scrollbar_offset))
                 goto fail;
             if (!rows || rows > UINT16_MAX || !cols || cols > UINT16_MAX
                 || cursor_col > UINT16_MAX || cursor_row > UINT16_MAX)
                 goto fail;
-            if (message.via.array.size >= 17
-                && (!unpack_rgb(field[13], &header.selection_background)
-                    || !unpack_rgb(field[14], &header.selection_foreground)
-                    || !object_bool(field[15],
-                                    &header.has_selection_background)
-                    || !object_bool(field[16],
-                                    &header.has_selection_foreground)))
+            if (!unpack_rgb(field[13], &header.selection_background)
+                || !unpack_rgb(field[14], &header.selection_foreground)
+                || !object_bool(field[15], &header.has_selection_background)
+                || !object_bool(field[16], &header.has_selection_foreground))
                 goto fail;
-            if (message.via.array.size == 22) {
-                uint64_t serial, above, below;
-                if (!object_bool(field[17], &header.viewport_scrollable)
-                    || !object_bool(field[18], &header.viewport_active)
-                    || !object_u64(field[19], &serial)
-                    || !object_u64(field[20], &above)
-                    || !object_u64(field[21], &below)
-                    || serial > UINT32_MAX || above > UINT16_MAX
-                    || below > UINT16_MAX)
-                    goto fail;
-                header.scroll_serial = (uint32_t)serial;
-                header.overscan_above = (uint16_t)above;
-                header.overscan_below = (uint16_t)below;
-            }
+            uint64_t serial, above, below;
+            if (!object_bool(field[17], &header.viewport_scrollable)
+                || !object_bool(field[18], &header.viewport_active)
+                || !object_u64(field[19], &serial)
+                || !object_u64(field[20], &above)
+                || !object_u64(field[21], &below)
+                || serial > UINT32_MAX || above > UINT16_MAX
+                || below > UINT16_MAX)
+                goto fail;
+            header.scroll_serial = (uint32_t)serial;
+            header.overscan_above = (uint16_t)above;
+            header.overscan_below = (uint16_t)below;
             if (rows + header.overscan_above + header.overscan_below
                     > UINT16_MAX) goto fail;
             header.rows = (uint16_t)rows;
@@ -355,20 +362,17 @@ static bool snapshot_unpack(const void *data, size_t len,
             header.cursor_row = (uint16_t)cursor_row;
             if (!snapshot_record(wire, SNAPSHOT_HEADER,
                                  &header, sizeof(header))) goto fail;
-        } else if (kind == SNAPSHOT_ROW
-                   && (message.via.array.size == 3
-                       || message.via.array.size == 4)) {
-            uint32_t cells_index = message.via.array.size == 4 ? 3 : 2;
+        } else if (kind == SNAPSHOT_ROW && message.via.array.size == 4) {
             int64_t row_index;
             if (!object_i64(field[1], &row_index)
                 || row_index < INT32_MIN || row_index > INT32_MAX
-                || field[cells_index].type != MSGPACK_OBJECT_ARRAY
-                || field[cells_index].via.array.size > UINT16_MAX) goto fail;
+                || field[3].type != MSGPACK_OBJECT_ARRAY
+                || field[3].via.array.size > UINT16_MAX) goto fail;
             SnapshotRow row = {
                 .row = (int32_t)row_index,
-                .cell_count = (uint16_t)field[cells_index].via.array.size,
+                .cell_count = (uint16_t)field[3].via.array.size,
             };
-            if (cells_index == 3 && !object_bool(field[2], &row.wrapped))
+            if (!object_bool(field[2], &row.wrapped))
                 goto fail;
             SnapshotRecord record = {
                 SNAPSHOT_ROW,
@@ -378,11 +382,9 @@ static bool snapshot_unpack(const void *data, size_t len,
             if (!snapshot_append(wire, &record, sizeof(record))
                 || !snapshot_append(wire, &row, sizeof(row))) goto fail;
             for (uint16_t j = 0; j < row.cell_count; j++) {
-                msgpack_object cell_object = field[cells_index].via.array.ptr[j];
+                msgpack_object cell_object = field[3].via.array.ptr[j];
                 if (cell_object.type != MSGPACK_OBJECT_ARRAY
-                    || (cell_object.via.array.size != 8
-                        && cell_object.via.array.size != 17
-                        && cell_object.via.array.size != 18)) goto fail;
+                    || cell_object.via.array.size != 18) goto fail;
                 msgpack_object *cell_field = cell_object.via.array.ptr;
                 uint64_t col;
                 SnapshotCell cell = {0};
@@ -390,47 +392,31 @@ static bool snapshot_unpack(const void *data, size_t len,
                     || col > UINT16_MAX
                     || !unpack_rgb(cell_field[1], &cell.foreground)
                     || !unpack_rgb(cell_field[2], &cell.background)) goto fail;
-                uint32_t text_index;
-                if (cell_object.via.array.size == 8) {
-                    // Compatibility with the first published Rocky server.
-                    if (!object_bool(cell_field[3], &cell.has_text)
-                        || !object_bool(cell_field[4], &cell.has_background)
-                        || !object_bool(cell_field[5], &cell.italic)
-                        || !object_bool(cell_field[6], &cell.bold)) goto fail;
-                    text_index = 7;
-                } else {
-                    uint64_t underline;
-                    if (!unpack_rgb(cell_field[3], &cell.underline_color)
-                        || !object_bool(cell_field[4], &cell.has_text)
-                        || !object_bool(cell_field[5], &cell.has_background)
-                        || !object_bool(cell_field[6],
-                                        &cell.has_underline_color)
-                        || !object_bool(cell_field[7], &cell.bold)
-                        || !object_bool(cell_field[8], &cell.italic)
-                        || !object_bool(cell_field[9], &cell.faint)
-                        || !object_bool(cell_field[10], &cell.blink)
-                        || !object_bool(cell_field[11], &cell.inverse)
-                        || !object_bool(cell_field[12], &cell.invisible)
-                        || !object_bool(cell_field[13], &cell.strikethrough)
-                        || !object_bool(cell_field[14], &cell.overline)
-                        || !object_u64(cell_field[15], &underline)
-                        || underline > UINT8_MAX) goto fail;
-                    cell.underline = (uint8_t)underline;
-                    text_index = 16;
-                    if (cell_object.via.array.size == 18) {
-                        uint64_t wide;
-                        if (!object_u64(cell_field[16], &wide)
-                            || wide > UINT8_MAX) goto fail;
-                        cell.wide = (uint8_t)wide;
-                        text_index = 17;
-                    }
-                }
-                if (cell_field[text_index].type != MSGPACK_OBJECT_STR
-                    || cell_field[text_index].via.str.size
+                uint64_t underline, wide;
+                if (!unpack_rgb(cell_field[3], &cell.underline_color)
+                    || !object_bool(cell_field[4], &cell.has_text)
+                    || !object_bool(cell_field[5], &cell.has_background)
+                    || !object_bool(cell_field[6], &cell.has_underline_color)
+                    || !object_bool(cell_field[7], &cell.bold)
+                    || !object_bool(cell_field[8], &cell.italic)
+                    || !object_bool(cell_field[9], &cell.faint)
+                    || !object_bool(cell_field[10], &cell.blink)
+                    || !object_bool(cell_field[11], &cell.inverse)
+                    || !object_bool(cell_field[12], &cell.invisible)
+                    || !object_bool(cell_field[13], &cell.strikethrough)
+                    || !object_bool(cell_field[14], &cell.overline)
+                    || !object_u64(cell_field[15], &underline)
+                    || underline > UINT8_MAX
+                    || !object_u64(cell_field[16], &wide)
+                    || wide > UINT8_MAX) goto fail;
+                cell.underline = (uint8_t)underline;
+                cell.wide = (uint8_t)wide;
+                if (cell_field[17].type != MSGPACK_OBJECT_STR
+                    || cell_field[17].via.str.size
                         >= sizeof(cell.text)) goto fail;
                 cell.col = (uint16_t)col;
-                memcpy(cell.text, cell_field[text_index].via.str.ptr,
-                       cell_field[text_index].via.str.size);
+                memcpy(cell.text, cell_field[17].via.str.ptr,
+                       cell_field[17].via.str.size);
                 if (!snapshot_append(wire, &cell, sizeof(cell))) goto fail;
             }
         } else if (kind == SNAPSHOT_IMAGE && message.via.array.size == 15
@@ -478,9 +464,25 @@ static bool snapshot_unpack(const void *data, size_t len,
                 || !snapshot_append(wire, &image, sizeof(image))
                 || !snapshot_append(wire, field[14].via.bin.ptr,
                                     image.pixel_len)) goto fail;
-        } else if (kind == SNAPSHOT_TITLE && message.via.array.size == 2
+        } else if (kind == SNAPSHOT_CONFIG && message.via.array.size == 5) {
+            SnapshotConfig config = {0};
+            uint64_t size, line;
+            if (field[1].type != MSGPACK_OBJECT_STR || field[4].type != MSGPACK_OBJECT_STR
+                || !object_u64(field[2], &size) || size < 6 || size > 96
+                || !object_u64(field[3], &line) || line > UINT32_MAX
+                || !field[1].via.str.size || field[1].via.str.size >= sizeof(config.font)
+                || field[4].via.str.size >= sizeof(config.path)
+                || memchr(field[1].via.str.ptr, 0, field[1].via.str.size)
+                || memchr(field[4].via.str.ptr, 0, field[4].via.str.size)) goto fail;
+            memcpy(config.font, field[1].via.str.ptr, field[1].via.str.size);
+            memcpy(config.path, field[4].via.str.ptr, field[4].via.str.size);
+            config.font_size = (uint32_t)size;
+            config.font_line = (uint32_t)line;
+            if (!snapshot_record(wire, SNAPSHOT_CONFIG, &config, sizeof(config))) goto fail;
+        } else if ((kind == SNAPSHOT_TITLE || kind == SNAPSHOT_ERROR) && message.via.array.size == 2
                    && field[1].type == MSGPACK_OBJECT_STR) {
-            if (!snapshot_record(wire, SNAPSHOT_TITLE,
+            if (kind == SNAPSHOT_ERROR && field[1].via.str.size > 4096) goto fail;
+            if (!snapshot_record(wire, (uint32_t)kind,
                     field[1].via.str.ptr, field[1].via.str.size)) goto fail;
         } else if (kind == SNAPSHOT_CLIPBOARD
                    && message.via.array.size == 3

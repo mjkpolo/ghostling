@@ -152,7 +152,7 @@ mkdir -p "$XDG_RUNTIME_DIR/gmux"
 ./gmux --connect "$XDG_RUNTIME_DIR/gmux/gmux.sock"
 ```
 
-Or let the session manager provision `xterm-kitty`, create secure socket
+Or let the session manager provision `xterm-ghostty`, create secure socket
 directories, detect stale sessions, and manage SSH Unix-socket forwarding:
 
 ```sh
@@ -162,8 +162,7 @@ directories, detect stale sessions, and manage SSH Unix-socket forwarding:
 `gmuxctl` is a standalone Python script. It first looks beside itself and on
 `PATH`, then in its download cache; if `gmux` is missing, it downloads and
 SHA-256 verifies the latest Rocky release into `$XDG_CACHE_HOME/gmux` (or
-`~/.cache/gmux`). Cached binaries are reused without a network update check;
-install a new release beside the script or remove the cached binary to update.
+`~/.cache/gmux`). Version checks reuse current binaries and update outdated ones.
 If the remote
 host lacks `gmux-server`, it asks before downloading the verified server and
 copying it to `~/.local/bin` or another directory you choose. An explicit
@@ -181,14 +180,18 @@ the remote host's normal session-lifetime policy.
 
 The manager uses `$GMUX_SOCKET_DIR`, then `$XDG_RUNTIME_DIR/gmux`, and finally
 `/tmp/gmux-$UID`. It requires the directory to be owned by the current user
-with mode `0700`; session sockets use mode `0600`. Remote `xterm-kitty`
+with mode `0700`; session sockets use mode `0600`. Remote `xterm-ghostty`
 terminfo is installed privately under the user's data directory. No root
-access is required.
+access is needed for this installation. The bundled definition comes from the
+same pinned Ghostty revision as libghostty-vt (see [terminfo provenance](terminfo/README.md)).
+New sessions use `TERM=xterm-ghostty` once provisioned; without that entry they
+fall back to `xterm-256color`. Existing sessions keep the environment they started with.
 
 ### Configuration
 
-Both binaries load `$XDG_CONFIG_HOME/gmux/config`, falling back to
-`~/.config/gmux/config` when that variable is unset or relative. For example:
+Only the server loads `$XDG_CONFIG_HOME/gmux/config`, falling back to
+`~/.config/gmux/config` when that variable is unset or empty. The client never
+reads or creates a config file. For example, on the server:
 
 ```ini
 font = Monaspace Argon Frozen, monospace
@@ -196,7 +199,7 @@ font-size = 24
 theme = Catppuccin Frappe
 ```
 
-Both binaries create this directory and a commented starter configuration on
+The server creates this directory and a commented starter configuration on
 first run. Existing configuration files are never overwritten.
 
 Fonts are discovered by Pango through the system font configuration; gmux no
@@ -204,11 +207,66 @@ longer bundles or extracts font files. Install Monaspace yourself to use it,
 or select another installed family. The default family list falls back to
 `monospace` when Monaspace is unavailable. `font-size` accepts integer
 sizes from 6 through 96. `Ctrl+Shift++` and `Ctrl+Shift+-` adjust the font size
-for the running client. Font settings are used by the client. The theme is
-loaded by `gmux-server`, so each remote server can choose its own appearance.
+for the server session, so reconnecting preserves the current size. This runtime
+override lasts for the server's lifetime (or until the config is reloaded); it
+does not rewrite the shared config. The server sends font choices to the client,
+which resolves them against locally installed fonts.
 Named themes are searched in the config directory's `themes` folder, `$GMUX_THEME_DIR`, the
 `themes` directory beside `gmux-server`, and the system gmux data directories.
 An absolute theme file path is also accepted.
+`gmuxctl` installs themes in the server's config directory (`~/.config/gmux/themes`
+normally), preserving existing files so customized themes are not overwritten.
+Existing theme folders are not deleted. To use a theme in an old location,
+specify its absolute path or set `GMUX_THEME_DIR` to that directory.
+
+On Linux, running servers watch the config directory with inotify. Saving
+`config` (including an editor's atomic rename) reloads fonts and theme and redraws
+attached clients without PTY activity or polling. Clearing/removing `theme`
+restores defaults; an unavailable theme leaves the current colors intact.
+Editing a theme file itself requires saving `config` again. Network filesystems may not notify this machine
+about edits performed on a different host.
+
+Config syntax/size errors and unavailable themes are sent to GTK as **SERVER
+ERROR** dialogs. Unavailable primary fonts produce **CLIENT ERROR** dialogs and
+use monospace as a fallback. Messages include the source file, line, option and
+configured value. Invalid themes do not prevent starting a session, so an attached
+client can display the diagnostic. Update both binaries for the new config records.
+
+### Live config editor
+
+In `gmuxctl`, press **c** or **e** to edit the host's shared config. Enter opens
+a fuzzy-search picker for installed client fonts, sizes 6–96, or server themes.
+Use arrows or Ctrl-N/Ctrl-P to navigate; typing resets to the first match.
+Highlighted choices immediately update a separate preview window in place.
+Enter accepts a choice; Escape restores the value before opening the picker.
+
+The preview runs in an isolated temporary server session/config. Unsaved changes
+are sent only to that temporary config, never the real host config. **s** saves
+the real config atomically and triggers reload in existing servers; **q** cancels.
+Both close and remove the preview. The editor preserves comments and unknown keys
+without adding concurrent-editor locking. Saving affects all sessions using
+that host config, not only the highlighted session.
+
+`GMUX_PREVIEW_COMMAND` specifies a command to run **on the remote host**. It
+defaults to `echo gmux`, followed by a shell so the preview stays open. For example:
+
+```sh
+GMUX_PREVIEW_COMMAND='printf "\\033[31mred\\033[0m normal\\n"' ./gmuxctl my-host
+```
+
+## Versions and updates
+
+`gmux --version` and `gmux-server --version` print the source revision
+(`-dirty` means a local build with uncommitted changes). Releases include a
+checksum-verified `VERSION` file. On startup, `gmuxctl` checks the latest release:
+matching binaries are reused; differing or old unversioned binaries are replaced.
+Client updates live in gmuxctl's private download cache rather than overwriting
+package-managed PATH entries. Remote server updates replace the installed binary
+atomically and copy matching themes. Existing sessions keep their old executable;
+only newly created sessions use the updated server. This is not an automatic
+migration of running sessions or a guarantee of cross-version protocol compatibility.
+Explicit `--client`/`--server-binary` overrides opt out of the corresponding update.
+If the release check is unavailable, installed binaries remain usable.
 
 ## FAQ
 
@@ -247,6 +305,10 @@ native Wayland input, layout-aware key events, clipboard
 access, and an event loop close to the one used by Ghostty itself.
 
 ### What did the source review change?
+
+See [CHANGE_AUDIT.md](CHANGE_AUDIT.md) for the change-by-change evidence,
+historical failing lines, local reproductions, and removals. The comparisons
+below describe architecture, not claims that these implementations were copied.
 
 - **Fonts:** Ghostty and WezTerm both bundle fonts and can open them directly
   from memory. Our Pango integration instead extracted them to temporary files

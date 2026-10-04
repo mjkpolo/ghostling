@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import stat
+import tarfile
 import tempfile
 from urllib.request import urlopen
 
@@ -71,7 +72,7 @@ def cache_dir():
 @cache
 def release_checksums():
     try:
-        with urlopen(f"{RELEASE_BASE}/SHA256SUMS", timeout=30) as response:
+        with urlopen(f"{RELEASE_BASE}/SHA256SUMS", timeout=5) as response:
             text = response.read().decode("ascii")
     except (OSError, UnicodeError) as error:
         raise RuntimeError(f"could not download gmux release checksums: {error}")
@@ -130,6 +131,44 @@ def local_program(name, explicit=None):
         return cached
     return release_asset(name, executable=True)
 
+def binary_version(output, name):
+    fields = output.strip().split()
+    return fields[1] if len(fields) == 2 and fields[0] == name else None
+
+def latest_version():
+    try:
+        # Older releases predate VERSION. Keep them usable during migration.
+        if "VERSION" not in release_checksums():
+            return None
+        version = release_asset("VERSION").read_text().strip()
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", version):
+            raise RuntimeError("invalid release version")
+        return version
+    except (OSError, RuntimeError) as error:
+        print(f"Update check unavailable; keeping installed binaries: {error}",
+              file=sys.stderr)
+        return None
+
+def update_client(client, version):
+    try:
+        current = subprocess.run([str(client), "--version"], capture_output=True,
+                                 text=True, timeout=5)
+        if current.returncode == 0 and binary_version(current.stdout, "gmux") == version:
+            return client
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    # Own our cache, not arbitrary PATH entries (possibly package-managed).
+    return release_asset("gmux", executable=True)
+
+def update_server(host, server, version):
+    current = run_ssh(host, '"$1" --version', server, check=False)
+    if (current.returncode == 0
+            and binary_version(current.stdout, "gmux-server") == version):
+        return server
+    print(f"Updating remote gmux-server to {version} (existing sessions keep running).")
+    return copy_server(host, release_asset("gmux-server", executable=True),
+                       str(Path(server).parent), release_themes=True)
+
 REMOTE_DIR = r'''
 set -eu
 if [ -n "${GMUX_SOCKET_DIR:-}" ]; then
@@ -168,13 +207,13 @@ printf '%s\n' "$directory"
 '''
     if directory is None:
         directory = run_ssh(host, directory_script).stdout.strip()
-    verify = 'test -r "$1/x/xterm-kitty" -o -r "$1/78/xterm-kitty"\n'
+    verify = 'test -r "$1/x/xterm-ghostty" -o -r "$1/78/xterm-ghostty"\n'
     if not checked and run_ssh(
             host, verify, directory, check=False).returncode == 0:
         return
-    source = HERE / "terminfo" / "xterm-kitty.terminfo"
+    source = HERE / "terminfo" / "xterm-ghostty.terminfo"
     if not source.is_file():
-        source = release_asset("xterm-kitty.terminfo")
+        source = release_asset("xterm-ghostty.terminfo")
     has_tic = run_ssh(host, "command -v tic >/dev/null 2>&1",
                       check=False).returncode == 0
     if has_tic:
@@ -189,10 +228,10 @@ printf '%s\n' "$directory"
         with tempfile.TemporaryDirectory(prefix="gmux-terminfo-") as temp:
             subprocess.run(["tic", "-x", "-o", temp, str(source)],
                            check=True)
-            entries = list(Path(temp).glob("*/xterm-kitty"))
+            entries = list(Path(temp).glob("*/xterm-ghostty"))
             if len(entries) != 1:
-                raise RuntimeError("local tic did not create xterm-kitty")
-            remote_entry = f"{directory}/{entries[0].parent.name}/xterm-kitty"
+                raise RuntimeError("local tic did not create xterm-ghostty")
+            remote_entry = f"{directory}/{entries[0].parent.name}/xterm-ghostty"
             command = (f"umask 077; mkdir -p "
                        f"{shlex.quote(str(Path(remote_entry).parent))}; "
                        f"cat > {shlex.quote(remote_entry)}; "
@@ -201,7 +240,42 @@ printf '%s\n' "$directory"
                            input=entries[0].read_bytes(), check=True)
     run_ssh(host, verify, directory)
 
-def copy_server(host, local_binary, destination="~/.local/bin"):
+def remote_config_dir(host):
+    return run_ssh(host, r'''
+set -eu
+directory=${XDG_CONFIG_HOME:-$HOME/.config}/gmux
+umask 077
+mkdir -p "$directory"
+printf '%s\n' "$directory"
+''').stdout.strip()
+
+def provision_themes(host, local_binary=None, force=False, release=False):
+    directory = remote_config_dir(host)
+    if not force and run_ssh(host,
+            'test -r "$1/themes/.gmux-installed"', directory,
+            check=False).returncode == 0:
+        return
+    candidates = [HERE / "themes", HERE / "build/themes"]
+    if local_binary:
+        candidates.insert(0, Path(local_binary).resolve().parent / "themes")
+    source = None if release else next(
+        (p for p in candidates if (p / "LICENSE").is_file()), None)
+    with tempfile.TemporaryDirectory(prefix="gmux-themes-") as temporary:
+        archive = Path(temporary) / "themes.tar.gz"
+        if source:
+            with tarfile.open(archive, "w:gz") as bundle:
+                for entry in sorted(source.iterdir()):
+                    if entry.is_file() and not entry.is_symlink():
+                        bundle.add(entry, arcname=f"themes/{entry.name}")
+        else:
+            archive = release_asset("gmux-themes.tar.gz")
+        command = (f"set -eu; umask 077; cd {shlex.quote(directory)}; "
+                   "tar -xzf - --skip-old-files --no-same-owner --no-same-permissions; "
+                   "touch themes/.gmux-installed")
+        with archive.open("rb") as stream:
+            subprocess.run(ssh_command(host, command), stdin=stream, check=True)
+
+def copy_server(host, local_binary, destination="~/.local/bin", release_themes=False):
     binary = Path(local_binary).expanduser().resolve()
     if not binary.is_file():
         raise RuntimeError(f"server binary not found: {binary}")
@@ -225,7 +299,9 @@ printf '%s\n' "$destination"
                "mv -f -- \"$temporary\" gmux-server")
     with binary.open("rb") as source:
         subprocess.run(ssh_command(host, command), stdin=source, check=True)
-    return f"{resolved}/gmux-server"
+    server = f"{resolved}/gmux-server"
+    provision_themes(host, binary, force=True, release=release_themes)
+    return server
 
 def sessions(host, server, directory):
     script = r'''
@@ -321,7 +397,7 @@ if [ -n "${XDG_DATA_HOME:-}" ]; then
 else
     terminfo=$HOME/.local/share/gmux/terminfo
 fi
-if [ -r "$terminfo/x/xterm-kitty" ] || [ -r "$terminfo/78/xterm-kitty" ]; then
+if [ -r "$terminfo/x/xterm-ghostty" ] || [ -r "$terminfo/78/xterm-ghostty" ]; then
     has_terminfo=yes
 else
     has_terminfo=no
@@ -362,6 +438,11 @@ def stop_attachment(attachment):
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     attachment["directory"].cleanup()
 
+def close_attachment(attachment):
+    attachment["client"].terminate()
+    attachment["client"].wait()
+    stop_attachment(attachment)
+
 def reap_attachments(attachments):
     active = []
     for attachment in attachments:
@@ -392,6 +473,158 @@ def draw_line(stdscr, row, text):
         except curses.error:
             pass  # Resizes and wide Unicode glyphs can change the space left.
 
+CONFIG_DEFAULTS = {"font": "Monaspace Argon Frozen, monospace",
+                   "font-size": "24", "theme": ""}
+
+def config_values(text):
+    values = dict(CONFIG_DEFAULTS)
+    for line in text.splitlines():
+        key, equals, value = line.partition("=")
+        if equals and key.strip() in values:
+            values[key.strip()] = value.strip()
+    return values
+
+def config_text(original, values):
+    # Preserve comments and unknown options rather than silently deleting them.
+    lines, seen = [], set()
+    for line in original.splitlines():
+        key = line.partition("=")[0].strip()
+        if "=" in line and key in values:
+            line = f"{key} = {values[key]}"
+            seen.add(key)
+        lines.append(line)
+    lines.extend(f"{key} = {value}" for key, value in values.items() if key not in seen)
+    return "\n".join(lines) + "\n"
+
+def write_remote_config(host, path, text):
+    run_ssh(host, r'''
+set -eu
+umask 077
+temporary=$(mktemp "$1.XXXXXX")
+trap 'rm -f -- "$temporary"' EXIT
+printf '%s' "$2" > "$temporary"
+mv -f -- "$temporary" "$1"
+''', path, text)
+
+def fuzzy_options(options, query):
+    query = query.casefold()
+    def matches(option):
+        letters = iter(option.casefold())
+        return all(any(letter == wanted for letter in letters) for wanted in query)
+    found = [option for option in options if matches(option)]
+    return sorted(found, key=lambda name: (not name.casefold().startswith(query),
+                                           len(name), name.casefold())) if query else options
+
+def config_picker(stdscr, key, options, current, preview):
+    query, selected, shown = "", options.index(current) if current in options else 0, current
+    while True:
+        height, width = stdscr.getmaxyx()
+        if height < 8 or width < 25:
+            return current
+        window = curses.newwin(height - 2, width - 4, 1, 2)
+        window.keypad(True)
+        window.box()
+        window.addnstr(1, 2, f"{key}: {query}", width - 9)
+        choices = fuzzy_options(options, query)
+        selected = min(selected, max(0, len(choices) - 1))
+        count = height - 7
+        start = max(0, selected - count + 1)
+        for row, index in enumerate(range(start, min(len(choices), start + count)), 2):
+            label = choices[index] or "(default colors)"
+            window.addnstr(row, 2, label, width - 9,
+                           curses.A_REVERSE if index == selected else 0)
+        window.addnstr(height - 4, 2, "Enter select  Esc cancel  Ctrl-N/P move", width - 9)
+        window.refresh()
+        if choices and choices[selected] != shown:
+            shown = choices[selected]
+            preview(shown)
+        pressed = window.getch()
+        if pressed == 27:
+            preview(current)
+            return current
+        if pressed in (10, 13, curses.KEY_ENTER) and choices:
+            return choices[selected]
+        if pressed in (curses.KEY_DOWN, 14):
+            selected = min(selected + 1, max(0, len(choices) - 1))
+        elif pressed in (curses.KEY_UP, 16):
+            selected = max(selected - 1, 0)
+        elif pressed in (curses.KEY_BACKSPACE, 127, 8):
+            query, selected = query[:-1], 0
+        elif 32 <= pressed < 127:
+            query, selected = query + chr(pressed), 0
+
+def edit_config(stdscr, host, server, directory, client):
+    config_dir = remote_config_dir(host)
+    path = f"{config_dir}/config"
+    original = run_ssh(host, 'if [ -f "$1" ]; then cat -- "$1"; fi', path).stdout
+    values = config_values(original)
+    themes = run_ssh(host, r'''
+for path in "$1/themes"/*; do
+    [ -f "$path" ] || continue
+    [ "${path##*/}" = LICENSE ] || printf '%s\n' "${path##*/}"
+done
+''', config_dir).stdout.splitlines()
+    fonts = subprocess.run([client, "--list-fonts"], check=True,
+                           capture_output=True, text=True).stdout.splitlines()
+    choices = {"font": sorted(set(fonts + [values["font"], "monospace"])),
+               "font-size": [str(size) for size in range(6, 97)],
+               "theme": [""] + sorted(set(themes + [values["theme"]]) - {""})}
+    preview_dir = run_ssh(host, 'umask 077; mktemp -d "$1/preview.XXXXXX"', directory).stdout.strip()
+    attachment = None
+    preview_path = f"{preview_dir}/gmux/config"
+    try:
+        # A private config and shell isolate preview output from real sessions.
+        run_ssh(host, r'''
+set -eu
+umask 077
+mkdir "$1/gmux"
+ln -s "$2/themes" "$1/gmux/themes"
+printf '#!/bin/sh\n%s\nexec /bin/sh\n' "$3" > "$1/shell"
+chmod 700 "$1/shell"
+''', preview_dir, config_dir, os.environ.get("GMUX_PREVIEW_COMMAND", "echo gmux"))
+        write_remote_config(host, preview_path, config_text(original, values))
+        run_ssh(host, 'XDG_CONFIG_HOME="$2" SHELL="$2/shell" "$1" "$2/preview.sock"',
+                server, preview_dir)
+        attachment = start_attachment(host, preview_dir, "preview", client)
+        selected, message = 0, ""
+        keys = list(CONFIG_DEFAULTS)
+        while True:
+            stdscr.erase()
+            height, _ = stdscr.getmaxyx()
+            draw_line(stdscr, 0, f"Config on {host} (all sessions): {path}")
+            draw_line(stdscr, 1, "Enter edit  j/k or Ctrl-N/P move  s save  q cancel")
+            for index, key in enumerate(keys):
+                draw_line(stdscr, index + 3,
+                          f"{'>' if index == selected else ' '} {key:12} [ {values[key]} ]")
+            draw_line(stdscr, height - 2, message or "Changes affect only the preview until saved.")
+            stdscr.refresh()
+            pressed = stdscr.getch()
+            if pressed in (ord("q"), 27):
+                return "Config changes discarded."
+            if pressed in (ord("j"), curses.KEY_DOWN, 14):
+                selected = min(selected + 1, len(keys) - 1)
+            elif pressed in (ord("k"), curses.KEY_UP, 16):
+                selected = max(selected - 1, 0)
+            elif pressed in (10, 13, curses.KEY_ENTER):
+                key = keys[selected]
+                def preview(value):
+                    values[key] = value
+                    write_remote_config(host, preview_path, config_text(original, values))
+                values[key] = config_picker(stdscr, key, choices[key], values[key], preview)
+            elif pressed == ord("s"):
+                write_remote_config(host, path, config_text(original, values))
+                return "Saved remote config; running servers will reload it."
+    finally:
+        if attachment:
+            close_attachment(attachment)
+        # Only files created by this editor, never the shared config/themes.
+        # --kill queues shutdown; it does not wait for the daemon to unlink.
+        run_ssh(host, r'''
+"$1" --kill "$2/preview.sock" >/dev/null 2>&1 || true
+rm -f -- "$2/preview.sock" "$2/gmux/config" "$2/gmux/themes" "$2/shell"
+rmdir "$2/gmux" "$2"
+''', server, preview_dir, check=False)
+
 def tui(stdscr, host, server, directory, client):
     curses.curs_set(0)
     stdscr.timeout(250)
@@ -415,7 +648,7 @@ def tui(stdscr, host, server, directory, client):
                 offset = selected - visible + 1
             stdscr.erase()
             draw_line(stdscr, 0, f"gmux sessions on {host}  ({directory})")
-            draw_line(stdscr, 1, "j/k move  Enter attach  n new  d delete  r refresh")
+            draw_line(stdscr, 1, "j/k move  Enter attach  n new  d delete  c/e config  r refresh")
             for index in range(offset, min(len(entries), offset + visible)):
                 status, name = entries[index]
                 marker = ">" if index == selected else " "
@@ -450,6 +683,11 @@ def tui(stdscr, host, server, directory, client):
                         message = f"Opened {name}; gmuxctl remains available."
                     except Exception as error:
                         message = str(error)
+            elif key in (ord("c"), ord("e")):
+                try:
+                    message = edit_config(stdscr, host, server, directory, client)
+                except Exception as error:
+                    message = str(error)
             elif key == ord("n"):
                 name = prompt(stdscr, "new session name: ")
                 try:
@@ -468,13 +706,7 @@ def tui(stdscr, host, server, directory, client):
                         message = str(error)
     finally:
         for attachment in attachments:
-            attachment["client"].terminate()
-            stop_attachment(attachment)
-            try:
-                attachment["client"].wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                attachment["client"].kill()
-                attachment["client"].wait()
+            close_attachment(attachment)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -484,6 +716,9 @@ def main():
                         help="local gmux-server binary override")
     args = parser.parse_args()
     client = local_program("gmux", args.client)
+    version = latest_version() if not (args.client and args.server_binary) else None
+    if version and not args.client:
+        client = update_client(client, version)
     with ssh_connection(args.host):
         server, directory, terminfo, has_terminfo = remote_state(args.host)
         if not server:
@@ -491,11 +726,17 @@ def main():
             if answer.lower() != "y":
                 return 1
             destination = input("remote directory [~/.local/bin]: ").strip()
-            server_binary = local_program("gmux-server", args.server_binary)
+            server_binary = (release_asset("gmux-server", executable=True)
+                             if version and not args.server_binary
+                             else local_program("gmux-server", args.server_binary))
             server = copy_server(args.host, server_binary,
-                                 destination or "~/.local/bin")
+                                 destination or "~/.local/bin",
+                                 release_themes=bool(version and not args.server_binary))
+        if version and not args.server_binary:
+            server = update_server(args.host, server, version)
         if not has_terminfo:
             provision_terminfo(args.host, terminfo, checked=True)
+        provision_themes(args.host, args.server_binary)
         curses.wrapper(tui, args.host, server, directory, str(client))
     return 0
 

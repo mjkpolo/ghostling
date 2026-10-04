@@ -9,9 +9,11 @@ rm -rf "$artifact_dir"
 mkdir -p "$artifact_dir"
 cp build/gmux build/gmux-server "$artifact_dir/"
 cp gmuxctl "$artifact_dir/"
+build/gmux-server --version | cut -d ' ' -f 2 > "$artifact_dir/VERSION"
+test "$(build/gmux --version | cut -d ' ' -f 2)" = "$(cat "$artifact_dir/VERSION")"
 cp -a build/themes "$artifact_dir/"
 cp -a terminfo "$artifact_dir/"
-cp terminfo/xterm-kitty.terminfo terminfo/KITTY-LICENSE "$artifact_dir/"
+cp terminfo/xterm-ghostty.terminfo terminfo/GHOSTTY-LICENSE "$artifact_dir/"
 tar -C "$artifact_dir" -czf "$artifact_dir/gmux-themes.tar.gz" themes
 
 {
@@ -30,5 +32,5 @@ tar -C "$artifact_dir" -czf "$artifact_dir/gmux-themes.tar.gz" themes
 (
   cd "$artifact_dir"
   sha256sum gmux gmux-server gmuxctl gmux-themes.tar.gz \
-    xterm-kitty.terminfo KITTY-LICENSE > SHA256SUMS
+    xterm-ghostty.terminfo GHOSTTY-LICENSE VERSION > SHA256SUMS
 )

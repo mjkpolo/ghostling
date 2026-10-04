@@ -10,8 +10,8 @@ static gboolean gtk_key_pressed(GtkEventControllerKey *controller,
         && (keyval == GDK_KEY_plus || keyval == GDK_KEY_equal
             || keyval == GDK_KEY_KP_Add)) {
         gtk_clear_selection(client);
-        if (client->font_size < 96) client->font_size++;
-        gtk_apply_font(client);
+        int8_t delta = 1;
+        gtk_client_send(client, INPUT_FONT_DELTA, &delta, sizeof(delta));
         return TRUE;
     }
     if ((state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
@@ -19,8 +19,8 @@ static gboolean gtk_key_pressed(GtkEventControllerKey *controller,
         && (keyval == GDK_KEY_minus || keyval == GDK_KEY_underscore
             || keyval == GDK_KEY_KP_Subtract)) {
         gtk_clear_selection(client);
-        if (client->font_size > 6) client->font_size--;
-        gtk_apply_font(client);
+        int8_t delta = -1;
+        gtk_client_send(client, INPUT_FONT_DELTA, &delta, sizeof(delta));
         return TRUE;
     }
     if ((state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
@@ -156,11 +156,6 @@ static void gtk_mouse_click(GtkGestureClick *gesture, int presses,
 static void gtk_mouse_pressed(GtkGestureClick *gesture, int presses,
                               double x, double y, gpointer userdata)
 {
-    GtkClient *client = userdata;
-    gtk_set_pending_clipboard(client);
-    // Retry a remote clipboard write once we have a Wayland input serial;
-    // retaining it indefinitely would overwrite later copies from other apps.
-    g_clear_pointer(&client->pending_clipboard, g_free);
     gtk_mouse_click(gesture, presses, x, y, userdata,
                     GHOSTTY_MOUSE_ACTION_PRESS);
 }

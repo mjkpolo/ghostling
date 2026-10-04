@@ -100,12 +100,38 @@ static void test_row_resize(void)
     render_client_free(&render);
 }
 
+static void test_font_fallback(void)
+{
+    GtkClient client = { .font_size = 24 };
+    client.regular = pango_font_description_new();
+    client.italic = pango_font_description_new();
+    client.bold = pango_font_description_new();
+    client.bold_italic = pango_font_description_new();
+    snprintf(client.font_family, sizeof(client.font_family),
+        "gmux-test-missing-font, DejaVu Sans Mono");
+    gtk_apply_font(&client);
+    assert(strcmp(pango_font_description_get_family(client.regular),
+        "gmux-test-missing-font, DejaVu Sans Mono, monospace") == 0);
+    assert(strcmp(pango_font_description_get_family(client.bold_italic),
+        "gmux-test-missing-font, DejaVu Sans Mono, monospace") == 0);
+
+    // Config strings are untrusted bytes; do not hand invalid UTF-8 to Pango.
+    strcpy(client.font_family, "\xff");
+    gtk_apply_font(&client);
+    assert(strcmp(pango_font_description_get_family(client.regular), "monospace") == 0);
+    pango_font_description_free(client.regular);
+    pango_font_description_free(client.italic);
+    pango_font_description_free(client.bold);
+    pango_font_description_free(client.bold_italic);
+}
+
 int main(void)
 {
     test_queued_paste();
     test_shortcut_release();
     test_selection_bounds();
     test_row_resize();
-    puts("client regressions: queued paste, shortcut release, selection, row resize passed");
+    test_font_fallback();
+    puts("client regressions: queued paste, shortcut release, selection, row resize, font fallback passed");
     return 0;
 }

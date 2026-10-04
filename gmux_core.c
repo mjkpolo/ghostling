@@ -16,6 +16,11 @@
 #include <limits.h>
 #include <math.h>
 #include <time.h>
+#ifdef GMUX_VERSION_HEADER
+#include "gmux_version.h"
+#else
+#define GMUX_VERSION "unknown"
+#endif
 
 #if defined(__APPLE__)
 #include <util.h>
@@ -31,15 +36,19 @@
 #include <ghostty/vt.h>
 #include <msgpack.h>
 #ifdef GMUX_SERVER
+#include <sys/inotify.h>
 #include "server_image.h"
 #endif
 
+#ifdef GMUX_SERVER
 #include "src/shared/config.inc"
+#endif
 // Keep the client and server as single translation units while grouping the
 // implementation by responsibility. This avoids an internal API layer whose
 // only purpose would be to split this small program across files.
 #include "src/shared/input_wire.inc"
 #include "src/server/theme_pty.inc"
+#include "src/server/config_watch.inc"
 #include "src/client/keymap.inc"
 #include "src/server/input.inc"
 #include "src/shared/snapshot_wire.inc"
@@ -55,6 +64,24 @@
 
 int main(int argc, char **argv)
 {
+#ifdef GMUX_CLIENT
+    if (argc == 2 && strcmp(argv[1], "--list-fonts") == 0) {
+        PangoFontFamily **families;
+        int count;
+        pango_font_map_list_families(pango_cairo_font_map_get_default(), &families, &count);
+        for (int i = 0; i < count; i++) puts(pango_font_family_get_name(families[i]));
+        g_free(families);
+        return 0;
+    }
+#endif
+    if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+#ifdef GMUX_SERVER
+        printf("gmux-server %s\n", GMUX_VERSION);
+#else
+        printf("gmux %s\n", GMUX_VERSION);
+#endif
+        return 0;
+    }
     signal(SIGPIPE, SIG_IGN);
 #ifdef GMUX_SERVER
     if (argc == 3 && strcmp(argv[1], "--check") == 0)
@@ -67,17 +94,18 @@ int main(int argc, char **argv)
     }
     fprintf(stderr,
             "usage: %s SOCKET\n       %s --check SOCKET\n"
-            "       %s --kill SOCKET\n", argv[0], argv[0], argv[0]);
+            "       %s --kill SOCKET\n       %s --version\n",
+            argv[0], argv[0], argv[0], argv[0]);
 #else
     if (argc == 3 && (strcmp(argv[1], "--kill") == 0 || strcmp(argv[1], "-kill") == 0))
         return kill_server_process(argv[2]);
     if (argc == 3 && strcmp(argv[1], "--connect") == 0) {
-        gmux_load_config();
         int socket_fd = unix_socket(argv[2], false);
         if (socket_fd < 0) { perror("connect to Unix socket"); return 1; }
         return run_client(socket_fd);
     }
-    fprintf(stderr, "usage: %s --connect SOCKET\n       %s --kill SOCKET\n", argv[0], argv[0]);
+    fprintf(stderr, "usage: %s --connect SOCKET\n       %s --kill SOCKET\n"
+            "       %s --version\n", argv[0], argv[0], argv[0]);
 #endif
     return 1;
 }

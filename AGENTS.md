@@ -46,7 +46,7 @@
   proposed remote transport; pane-layout details are undecided.
 - `gmuxctl` is the dependency-free Python/curses session manager. It discovers
   remote sockets, distinguishes live and stale sessions with `gmux-server
-  --check`, creates and deletes sessions, provisions the bundled `xterm-kitty`
+  --check`, creates and deletes sessions, provisions the bundled `xterm-ghostty`
   terminfo, and owns per-attachment SSH Unix-socket forwarding. Socket
   directories must be user-owned mode `0700`; sockets must be mode `0600`.
 - The manager owns a private SSH ControlMaster and a distinct directory per
@@ -64,6 +64,12 @@
   `ZIG_LOCAL_CACHE_DIR=/home/ma148697/codex_projects/ghostling/build/.zig-cache`.
 - The client uses installed fonts through Pango; it no longer embeds or
   extracts font files. Default: `Monaspace Argon Frozen, monospace`, size 24.
+- Configuration belongs only to the server. Font settings/errors travel in
+  snapshots; runtime font-size adjustments are retained by the server session.
+  `gmuxctl` installs themes under the remote config directory and provides a
+  c/e editor with an isolated temporary preview. Saving affects the host's
+  shared config; cancelling must not modify it. Never delete existing client
+  config files or legacy theme folders as part of this migration.
 - Rendering and input are event-driven. The server sends changed rows; the GTK
   client retains the current visible rows and overscan. Preserve Kitty images
   when changing dirty tracking or snapshot handling.

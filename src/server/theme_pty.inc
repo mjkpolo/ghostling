@@ -54,15 +54,24 @@ static bool server_theme_path(const char *name, char *out, size_t size)
 static bool server_theme_load(ServerTheme *theme)
 {
     char path[PATH_MAX];
-    if (!*gmux_config.theme
-        || !server_theme_path(gmux_config.theme, path, sizeof(path)))
+    if (!*gmux_config.theme) return false;
+    if (!server_theme_path(gmux_config.theme, path, sizeof(path))) {
+        config_error(gmux_config.path, gmux_config.theme_line, "theme",
+                     gmux_config.theme, "Theme not found or not readable");
         return false;
+    }
     FILE *file = fopen(path, "r");
-    if (!file) return false;
+    if (!file) {
+        config_error(gmux_config.path, gmux_config.theme_line, "theme",
+                     gmux_config.theme, strerror(errno));
+        return false;
+    }
 
     ghostty_color_palette_default(theme->palette);
     char line[512];
+    unsigned line_number = 0;
     while (fgets(line, sizeof(line), file)) {
+        line_number++;
         char *entry = trim_ascii(line);
         if (!*entry || *entry == '#') continue;
         char *equals = strchr(entry, '=');
@@ -95,15 +104,20 @@ static bool server_theme_load(ServerTheme *theme)
                 theme->palette[index] = rgb;
                 GHOSTTY_COLOR_PALETTE_MASK_SET(&theme->palette_mask, index);
                 theme->has_palette = true;
-            }
+            } else config_error(path, line_number, key, value, "Invalid palette entry");
             continue;
         } else {
             continue;
         }
         *present = ghostty_color_parse(value, strlen(value), color)
             == GHOSTTY_SUCCESS;
+        if (!*present) config_error(path, line_number, key, value, "Invalid color");
     }
+    bool readable = !ferror(file);
+    if (!readable) config_error(gmux_config.path, gmux_config.theme_line, "theme",
+                                gmux_config.theme, "Cannot read theme file");
     fclose(file);
+    if (!readable) return false;
 
     if (theme->has_palette) {
         GhosttyColorRgb background = theme->has_background
@@ -119,18 +133,18 @@ static bool server_theme_load(ServerTheme *theme)
 static void server_theme_apply(GhosttyTerminal terminal,
                                const ServerTheme *theme)
 {
-    if (theme->has_foreground)
-        ghostty_terminal_set(terminal,
-            GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, &theme->foreground);
-    if (theme->has_background)
-        ghostty_terminal_set(terminal,
-            GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, &theme->background);
-    if (theme->has_cursor)
-        ghostty_terminal_set(terminal,
-            GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, &theme->cursor);
-    if (theme->has_palette)
-        ghostty_terminal_set(terminal,
-            GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, theme->palette);
+    // RenderState updates foreground/background only when both are set. Supply
+    // its white/black defaults explicitly, including when clearing a theme.
+    // Application OSC overrides remain intact.
+    GhosttyColorRgb foreground = {255, 255, 255}, background = {0, 0, 0};
+    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND,
+        theme->has_foreground ? &theme->foreground : &foreground);
+    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND,
+        theme->has_background ? &theme->background : &background);
+    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_COLOR_CURSOR,
+        theme->has_cursor ? &theme->cursor : NULL);
+    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_COLOR_PALETTE,
+        theme->has_palette ? theme->palette : NULL);
 }
 
 static bool server_terminfo_dir(char *out, size_t size)
@@ -149,13 +163,13 @@ static bool server_terminfo_dir(char *out, size_t size)
             < (int)size;
 }
 
-static bool server_has_kitty_terminfo(char *directory, size_t size)
+static bool server_has_ghostty_terminfo(char *directory, size_t size)
 {
     if (!server_terminfo_dir(directory, size)) return false;
     char entry[PATH_MAX];
-    return (snprintf(entry, sizeof(entry), "%s/x/xterm-kitty", directory)
+    return (snprintf(entry, sizeof(entry), "%s/x/xterm-ghostty", directory)
                 < (int)sizeof(entry) && access(entry, R_OK) == 0)
-        || (snprintf(entry, sizeof(entry), "%s/78/xterm-kitty", directory)
+        || (snprintf(entry, sizeof(entry), "%s/78/xterm-ghostty", directory)
                 < (int)sizeof(entry) && access(entry, R_OK) == 0);
 }
 
@@ -210,8 +224,8 @@ static int pty_spawn(pid_t *child_out, uint16_t cols, uint16_t rows,
         // Child process — replace ourselves with the shell.
         // TERM tells programs what escape sequences we understand.
         char terminfo[PATH_MAX];
-        if (server_has_kitty_terminfo(terminfo, sizeof(terminfo))) {
-            setenv("TERM", "xterm-kitty", 1);
+        if (server_has_ghostty_terminfo(terminfo, sizeof(terminfo))) {
+            setenv("TERM", "xterm-ghostty", 1);
             setenv("TERMINFO", terminfo, 1);
         } else {
             setenv("TERM", "xterm-256color", 1);
@@ -220,16 +234,15 @@ static int pty_spawn(pid_t *child_out, uint16_t cols, uint16_t rows,
         _exit(127); // execl only returns on error
     }
 
-    *child_out = child;
     // Neither draining output nor a large paste may block the event loop.
     int flags = fcntl(pty_fd, F_GETFL);
-    if (flags < 0 || fcntl(pty_fd, F_SETFL, flags | O_NONBLOCK) < 0
-        || fcntl(pty_fd, F_SETFD, FD_CLOEXEC) < 0) {
+    if (flags < 0 || fcntl(pty_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
         perror("fcntl O_NONBLOCK");
         close(pty_fd);
         return -1;
     }
 
+    *child_out = child;
     return pty_fd;
 }
 
@@ -278,7 +291,7 @@ static PtyReadResult pty_read(int pty_fd, GhosttyTerminal terminal,
             return PTY_READ_EOF;
         } else {
             // n == -1: distinguish "no data right now" from real errors.
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            if (errno == EAGAIN)
                 return PTY_READ_OK;
             if (errno == EINTR)
                 continue; // retry the read

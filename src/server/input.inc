@@ -38,6 +38,13 @@ static bool apply_input_wire(InputWire *wire, Pty *pty,
             server_stop = 1;
         } else if (record.kind == INPUT_PING && record.size == 0) {
             *ping_requested = true;
+        } else if (record.kind == INPUT_FONT_DELTA && record.size == sizeof(int8_t)) {
+            int next = gmux_config.font_size + *(int8_t *)payload;
+            if (next >= 6 && next <= 96) {
+                gmux_config.font_size = next;
+                gmux_config.revision++;
+                terminal_changed = true;
+            }
         } else if (record.kind == INPUT_RESIZE
                    && record.size == sizeof(InputResize)) {
             memcpy(size, payload, sizeof(*size));

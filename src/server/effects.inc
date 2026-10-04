@@ -120,8 +120,6 @@ static GhosttyClipboardWriteResult effect_clipboard_write(
         return GHOSTTY_CLIPBOARD_WRITE_RESULT_UNSUPPORTED;
 
     size_t len = text ? text->len : 0;
-    if (len > MAX_WIRE_MESSAGE - sizeof(SnapshotClipboard))
-        return GHOSTTY_CLIPBOARD_WRITE_RESULT_BUSY;
     uint8_t *copy = malloc(len + 1);
     if (!copy) return GHOSTTY_CLIPBOARD_WRITE_RESULT_BUSY;
     if (len) memcpy(copy, text->ptr, len);
