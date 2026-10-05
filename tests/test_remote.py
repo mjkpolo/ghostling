@@ -224,11 +224,27 @@ class ReleaseDownloadTest(unittest.TestCase):
             client.write_bytes(b"cached executable")
             client.chmod(0o700)
             with mock.patch.object(remote, "HERE", cache / "elsewhere"), \
+                    mock.patch.object(remote.Path, "home", return_value=cache), \
                     mock.patch.object(remote.shutil, "which", return_value=None), \
                     mock.patch.object(remote, "cache_dir", return_value=cache), \
                     mock.patch.object(remote, "release_asset") as download:
                 self.assertEqual(remote.local_program("gmux"), client)
                 download.assert_not_called()
+
+    def test_path_precedes_cache_without_user_bin_override(self):
+        remote = load_remote()
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            binary = home / ".local/bin/gmux"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"test executable")
+            binary.chmod(0o700)
+            with mock.patch.object(remote.Path, "home", return_value=home), \
+                 mock.patch.object(remote.shutil, "which", return_value="/usr/bin/gmux") as which, \
+                 mock.patch.object(remote, "cache_dir") as cache:
+                self.assertEqual(remote.local_program("gmux"), Path("/usr/bin/gmux").resolve())
+                which.assert_called_once_with("gmux")
+                cache.assert_not_called()
 
     def test_remote_state_uses_one_ssh_result(self):
         remote = load_remote()

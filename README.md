@@ -1,391 +1,167 @@
-# gmux — a small remote terminal built from Ghostling
+# gmux
 
-This is a learning project based on
-[Ghostling](https://github.com/ghostty-org/ghostling), a minimal terminal using
-libghostty's C API.
+Persistent local and remote terminals, managed in one desktop window.
 
-The Linux client uses GTK4/GDK for native Wayland/X11 windowing and Cairo/Pango
-for its initial renderer. The authoritative terminal lives in a separate,
-persistent `gmux-server` process and communicates with the GUI over a Unix
-socket.
+- **gmux-manager**: Python/Qt host, folder, session, and config manager.
+- **gmux**: Linux GTK terminal window.
+- **gmux-server**: persistent headless terminal powered by libghostty.
 
-> [!WARNING]
->
-> This is an experimental terminal, not a replacement for a mature terminal's
-> compatibility and security testing.
+An experimental learning project. Current binary releases target Linux x86-64.
 
-<p align="center">
-  <img src="demo.gif" alt="Ghostling Demo" />
-</p>
+## Install the manager
 
-## What is Libghostty?
-
-Libghostty is an embeddable library extracted from [Ghostty's](https://ghostty.org) core,
-exposing a C and Zig API so any application can embed correct, fast terminal
-emulation.
-
-The server uses **libghostty-vt** for VT parsing, cursor and cell state,
-styles, text reflow, scrollback, and render-state snapshots. It contains no
-windowing or drawing code. Our GTK client draws the resulting rows and images;
-it does not parse the application's VT output again.
-
-## Features
-
-Despite being a minimal, thin layer above libghostty, look at all the
-features you _do get_:
-
-- Resize with text reflow
-- Full 24-bit color and 256-color palette support
-- Bold, italic, and inverse text styles
-- Unicode text, Pango/HarfBuzz shaping, and ligatures
-- Keyboard input with modifier support (Shift, Ctrl, Alt, Super)
-- Kitty keyboard protocol
-- Kitty graphics protocol
-- Mouse tracking (X10, normal, button, and any-event modes)
-- Mouse reporting formats (SGR, URxvt, UTF8, X10)
-- Scroll wheel support (viewport scrollback or forwarded to applications)
-- Scrollbar position indicator
-- Focus reporting (CSI I / CSI O)
-- Local text selection and clipboard shortcuts
-- OSC 52 clipboard writes
-- Configurable installed fonts and server-owned color themes
-- SSH session management through `gmuxctl`
-
-### Limitations
-
-There are some known issues with this demo:
-
-- GTK now supplies event-driven key press, repeat, release, modifier, and
-  consumed-modifier information. Compose/IME commit handling and the complete
-  physical-key mapping are still being ported from Ghostty's GTK frontend.
-- The current client targets Linux. There are no tabs, splits, or search UI.
-- A server accepts one attached GUI at a time; open separate sessions for
-  simultaneous windows.
-- Double-forking detaches from a shell, but cannot override a host policy that
-  terminates processes at logout. Persistence depends on the host's session
-  management; the SSH transport alone does not guarantee it.
-
-## Building
-
-Requirements:
-
-- [CMake](https://cmake.org/) 3.19+
-- [Ninja](https://ninja-build.org/)
-- A C compiler
-- `curl`, `sha256sum`, and `tar` for `./build.sh` to fetch Zig 0.16.0
-- Linux (Ubuntu/Debian): `sudo apt install -y ninja-build build-essential git libgtk-4-dev`
+Install Python 3.9 or newer and OpenSSH. Download the manager wheel from the
+[latest release](https://github.com/mjkpolo/ghostling/releases/latest), then:
 
 ```sh
-./build.sh
-install -d -m 700 "$XDG_RUNTIME_DIR/gmux"
-./build/gmux-server "$XDG_RUNTIME_DIR/gmux/default.sock"
-./build/gmux --connect "$XDG_RUNTIME_DIR/gmux/default.sock"
+python3 -m venv ~/.local/share/gmux-manager-venv
+~/.local/share/gmux-manager-venv/bin/pip install ./gmux_manager-0.1.0-py3-none-any.whl
+~/.local/share/gmux-manager-venv/bin/gmux-manager --install-desktop
 ```
 
-For a headless server build on another machine, clone with submodules and run:
+Launch **gmux Manager** from your application launcher, or run:
 
 ```sh
-mkdir -p "$HOME/codex_projects"
-cd "$HOME/codex_projects"
-git clone --recurse-submodules -b gmux-codex git@github.com:mjkpolo/ghostling.git
-cd ghostling
-./build.sh --server-only
+~/.local/share/gmux-manager-venv/bin/gmux-manager
 ```
 
-The script downloads checksum-verified Zig 0.16.0 into the parent directory of
-the checkout when it is absent. The server embeds libghostty-vt and MessagePack,
-but normal local builds use the build system's libc dynamically. For the
-portable x86-64 Linux release server, run `./build.sh --server-musl` instead.
-The output is `build/server-musl/gmux-server`, statically linked with musl
-and compiled for baseline x86-64 CPUs. It needs no installed libc or GTK.
+No compilation is needed. Pip installs PySide6; system graphics libraries are
+still required, including `libEGL.so.1` (`libegl1` on Ubuntu). The terminal window
+also requires GTK4 runtime libraries. Keep the virtual environment—the desktop
+launcher uses it.
 
-> [!WARNING]
->
-> Debug builds are VERY SLOW since Ghostty included a lot of extra
-> safety and correctness checks. Do not benchmark debug builds.
+Installation locations:
 
-For a release (optimized) build:
+- Manager environment: `~/.local/share/gmux-manager-venv` in the commands above.
+- Desktop entry: `~/.local/share/applications/gmux-manager.desktop`.
+- Launcher icon: `~/.local/share/icons/hicolor/scalable/apps/gmux-manager.svg`.
+- Downloaded binaries: `~/.cache/gmux`.
+
+The desktop entry and icon honor `XDG_DATA_HOME`; downloads honor `XDG_CACHE_HOME`.
+The launcher has no client/server path overrides. Installed binaries are found
+through **PATH**, not a hardcoded bin directory. To use `~/.local/bin`, include
+it in your desktop session's PATH and in the remote noninteractive SSH PATH.
+
+The manager checks release versions for both binaries. It downloads an updated
+client into its own cache without overwriting PATH installations. Server upgrades
+require confirmation, with a warning before stopping running sessions. If release
+checks are unavailable, installed binaries remain usable. The manager itself is
+updated with pip, not automatically.
+
+Alternatively, install the development branch into that environment:
 
 ```sh
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+~/.local/share/gmux-manager-venv/bin/pip install --upgrade \
+  "git+https://github.com/mjkpolo/ghostling.git@gmux-codex"
 ```
 
-After the initial configuration, you only need to run the build step:
+There is no PyPI publication. To update from a release, install the new wheel
+with `pip install --force-reinstall /path/to/the.whl`, then restart the manager.
 
-```sh
-cmake --build build
-```
+## Use it
 
-To clean up the build directory:
+1. Select **localhost** or a remote host, then **Connect**.
+2. If needed, choose **Install server…** (default: `~/.local/bin`). This also
+   installs themes and the terminal definition. The client is downloaded when
+   absent from PATH and the manager's cache.
+3. Choose **New session**, then **Open terminal**, or double-click a session.
 
-```sh
-cmake --build build --target clean
-```
+**localhost** always appears and connects directly through Unix sockets; it
+does not need an SSH server. Remote hosts come from named entries in
+`~/.ssh/config` and its includes. Edit those files yourself, then **Reload hosts**.
 
-### Regression tests
+Remote connections use OpenSSH keys, agents, or graphical password/MFA prompts.
+Unknown host fingerprints require explicit approval. Credentials are not saved.
+Remote metadata management requires `python3`, with no extra Python packages.
 
-After building both binaries:
+### Folders and names
 
-```sh
-./tests/run.sh
-# Optional memory/undefined-behavior checks for our C code:
-SANITIZE=1 ./tests/run.sh
-```
+Connecting checks the installed server against the latest release. If different,
+the manager asks before upgrading. Running sessions trigger an explicit warning:
+accepting stops their shells and applications; declining leaves them untouched.
+The check compares the installed binary, not the version inside existing server
+processes. Manually replacing the binary does not update already-running sessions.
 
-The tests exercise queued socket/PTY writes, fragmented messages and EOF,
-malformed input, long graphemes, RGB/RGBA Kitty images, row-cache resizing, local shortcuts, config
-creation, session-manager behavior, and health/kill commands while attached.
-They use private temporary sockets and do not connect to a remote host. The
-vendored libraries are the normal build's libraries, not sanitizer rebuilds.
+Use **New folder**, **Rename folder**, **Move…**, and **Rename…** to organize
+sessions. **Open folder** opens every available session in the selected folder,
+skipping attached sessions. **Delete folder** moves its sessions to Unfiled;
+it does not stop them. Session **Delete** terminates a session after confirmation.
 
-## Linux releases
+Sockets have stable random IDs. Names and folders are separate metadata, so
+renaming never moves a socket. Existing named sockets remain usable under
+**Unfiled**. Saved names override application titles in manager-launched windows.
+Renames update owned windows immediately; **Refresh** picks up other managers'
+changes. Folder/session metadata uses a separate file lock and atomic replacement.
 
-### Qt host manager
+Closing a terminal leaves its server running. Closing the manager hides it in
+the tray when available; **Quit manager** exits. Relaunching restores the same
+manager window. Without a tray, closing exits normally. Sessions do not survive
+reboots and remain subject to the host's logout/cleanup policies.
 
-`gmux-manager` opens the Python/PySide6 manager. It reads named aliases from
-`~/.ssh/config` and `Include` files; wildcard/negated patterns are not selectable
-hosts. OpenSSH still resolves all actual connection options, including `Match`.
-The manager never edits SSH config. Use **Reload hosts** after editing it.
+### Appearance
 
-Install its dependencies once (all tools remain outside the source tree):
+Choose **Config…** to edit the host's font, font size, and theme. Open terminals
+preview changes in place. If none are attached, a disposable preview terminal
+opens and is removed when you finish. **Save** keeps changes; **Cancel** restores
+the original config. Preview temporarily edits the shared config, so do not edit
+it elsewhere simultaneously. A forcibly killed manager may leave its last preview.
 
-```sh
-python3 -m venv ../tools/gmux-manager-venv
-PIP_CACHE_DIR=../.cache/pip ../tools/gmux-manager-venv/bin/pip install .
-../tools/gmux-manager-venv/bin/gmux-manager
-# Optional: test a specific terminal executable without release downloads
-../tools/gmux-manager-venv/bin/gmux-manager --client "$PWD/build/gmux"
-```
-
-Select a host, then **Connect**. Create sessions with **New session**, and
-double-click an available session to open a terminal without leaving the manager.
-**Refresh** updates that host's session status. Each connected host retains its
-own SSH master. **Delete** asks for confirmation, including for stale sockets.
-If the remote server is missing, **Install server** asks for its remote destination
-directory (default `~/.local/bin`), then downloads the checksum-verified release
-server and themes. Published servers currently target Linux x86-64.
-
-Authentication uses configured SSH keys/agent or graphical password/MFA prompts,
-with explicit confirmation for unknown host fingerprints. This first version uses installed/cached
-binaries without automatic version updates,
-and asks before closing its terminal windows when quitting. Closing the window hides it in the tray when a tray is available. The tray menu
-has **Show manager** and **Quit**. With no tray, closing quits normally. Launching
-again shows the existing instance. Terminal exits notify the UI via blocking OS
-process waits, not a polling timer; unrelated external session changes still need
-**Refresh**. Remote sessions are not killed on manager exit. The shared manager targets Linux/macOS, but only Linux
-has been tested so far; a native macOS terminal client is separate future work.
-
-Tests: `./tests/run.sh` includes the manager's non-GUI tests. With PySide6 installed,
-run `QT_QPA_PLATFORM=offscreen ../tools/gmux-manager-venv/bin/python -m unittest manager.test_ui`.
-Local live verification also covered localhost SSH, two GTK windows under isolated
-headless Sway, reconnecting to surviving sessions, and removal of only test sessions.
-
-### Published binaries
-
-- Every push to `gmux-codex` publishes a GitHub release containing `gmux`,
-  `gmux-server`, a pip-installable manager wheel, themes, terminfo, and `SHA256SUMS`. The binaries
-  use Rocky Linux 9.4 for the GTK client's glibc 2.34 baseline; the server
-  is fully static musl with baseline x86-64 CPU instructions. CI checks that
-  the server has no dynamic loader or shared-library dependencies and runs
-  its lifecycle tests. The Actions run also
-  retains the combined `gmux-rocky-linux-9.4-x86_64` artifact.
-
-Run both binaries directly:
-
-```sh
-mkdir -p "$XDG_RUNTIME_DIR/gmux"
-./gmux-server "$XDG_RUNTIME_DIR/gmux/gmux.sock"
-./gmux --connect "$XDG_RUNTIME_DIR/gmux/gmux.sock"
-```
-
-Install the shared Qt manager from the repository (or install the wheel attached
-to a GitHub release):
-
-```sh
-python3 -m pip install "git+https://github.com/mjkpolo/ghostling.git@gmux-codex"
-gmux-manager --install-desktop  # Linux application menu / Fuzzel
-gmux-manager
-```
-
-Use a virtual environment or pipx if your system Python is externally managed.
-To install without building, download `gmux_manager-0.1.0-py3-none-any.whl`
-from the GitHub release and run these commands inside a virtual environment:
-
-```sh
-python -m pip install ./gmux_manager-0.1.0-py3-none-any.whl
-gmux-manager --install-desktop
-```
-
-The wheel includes the manager, desktop launcher, and icon. Pip installs its
-PySide6 dependency separately; Python and system Qt runtime libraries (including
-`libEGL.so.1`, provided by `libegl1` on Ubuntu) are still required. CI builds and
-tests the manager on Linux only.
-
-This does not publish the package to PyPI; bare `pip install gmux-manager` is
-not yet a supported installation route. Linux's desktop launcher records the
-environment's absolute Python path, so that environment must remain installed.
-It adds no autostart entry and does not change Sway keybindings. macOS uses
-`gmux-manager` directly for now; .app packaging is future work.
-
-The manager looks for `gmux` on PATH and in its download cache, downloading and
-checking the release checksum if absent. Use `--client /path/to/gmux` to select
-a bespoke client (required on macOS until one is published). One private SSH
-ControlMaster serves each connected host. Every terminal window gets its own
-private Unix-socket forward; the forward is removed when the window exits.
-Host-key trust and authentication remain OpenSSH's responsibility.
-The standard `SSH_ASKPASS` mechanism opens a Qt password/passphrase or MFA
-dialog during connection. Credentials are passed directly back to SSH, never
-saved. Unknown hosts require explicit fingerprint confirmation (default: No);
-changed host keys are rejected by SSH. Later commands reuse the authenticated
-master and do not prompt if it has disconnected.
-
-The manager uses `$GMUX_SOCKET_DIR`, then `$XDG_RUNTIME_DIR/gmux`, and finally
-`/tmp/gmux-$UID`. It requires the directory to be owned by the current user
-with mode `0700`; session sockets use mode `0600`. Remote `xterm-ghostty`
-terminfo is installed privately under the user's data directory. No root
-access is needed for this installation. The bundled definition comes from the
-same pinned Ghostty revision as libghostty-vt (see [terminfo provenance](terminfo/README.md)).
-New sessions use `TERM=xterm-ghostty` once provisioned; without that entry they
-fall back to `xterm-256color`. Existing sessions keep the environment they started with.
-
-### Configuration
-
-Only the server loads `$XDG_CONFIG_HOME/gmux/config`, falling back to
-`~/.config/gmux/config` when that variable is unset or empty. The client never
-reads or creates a config file. For example, on the server:
+Configuration belongs to the session host (localhost counts as a host):
 
 ```ini
+# ~/.config/gmux/config, or $XDG_CONFIG_HOME/gmux/config
 font = Monaspace Argon Frozen, monospace
 font-size = 24
-theme = Catppuccin Frappe
+theme =
 ```
 
-The server creates this directory and a commented starter configuration on
-first run. Existing configuration files are never overwritten.
+Fonts must be installed on the GUI machine. Themes live in the host's
+`~/.config/gmux/themes`; metadata lives alongside the config in `sessions.json`.
+The server reloads config changes automatically. There is no separate client config.
 
-Fonts are discovered by Pango through the system font configuration; gmux no
-longer bundles or extracts font files. Install Monaspace yourself to use it,
-or select another installed family. The default family list falls back to
-`monospace` when Monaspace is unavailable. `font-size` accepts integer
-sizes from 6 through 96. `Ctrl+Shift++` and `Ctrl+Shift+-` adjust the font size
-for the server session, so reconnecting preserves the current size. This runtime
-override lasts for the server's lifetime (or until the config is reloaded); it
-does not rewrite the shared config. The server sends font choices to the client,
-which resolves them against locally installed fonts.
-Named themes are searched in the config directory's `themes` folder, `$GMUX_THEME_DIR`, the
-`themes` directory beside `gmux-server`, and the system gmux data directories.
-An absolute theme file path is also accepted.
-The manager installs themes in the server's config directory (`~/.config/gmux/themes`
-normally), preserving existing files so customized themes are not overwritten.
-Existing theme folders are not deleted. To use a theme in an old location,
-specify its absolute path or set `GMUX_THEME_DIR` to that directory.
+Socket directories are private (`0700`), with `0600` sockets. `GMUX_SOCKET_DIR`
+overrides their location; otherwise gmux uses `$XDG_RUNTIME_DIR/gmux` or
+`/tmp/gmux-<uid>`. Remote sockets are forwarded through SSH, not exposed over TCP.
 
-On Linux, running servers watch the config directory with inotify. Saving
-`config` (including an editor's atomic rename) reloads fonts and theme and redraws
-attached clients without PTY activity or polling. Clearing/removing `theme`
-restores defaults; an unavailable theme leaves the current colors intact.
-Editing a theme file itself requires saving `config` again. Network filesystems may not notify this machine
-about edits performed on a different host.
+## Run without the manager
 
-Config syntax/size errors and unavailable themes are sent to GTK as **SERVER
-ERROR** dialogs. Unavailable primary fonts produce **CLIENT ERROR** dialogs and
-use monospace as a fallback. Messages include the source file, line, option and
-configured value. Invalid themes do not prevent starting a session, so an attached
-client can display the diagnostic. Update both binaries for the new config records.
+Download `gmux` and `gmux-server` from a release and make them executable.
+The server is static musl with baseline x86-64 instructions. The GTK client is
+built on Rocky Linux 9.4 and needs compatible system libraries.
 
-### Config editing
+```sh
+gmux-server /path/to/private-directory/work.sock
+gmux --connect /path/to/private-directory/work.sock
+gmux-server --kill /path/to/private-directory/work.sock
+```
 
-The old curses editor and `GMUX_PREVIEW_COMMAND` were removed with gmuxctl.
-For now edit the server config directly; running servers reload it automatically.
-Choose **Config…** on a connected host to edit its font, font size, and theme.
-Changes preview through the shared remote config in running sessions. If no
-terminal is attached, the editor opens a disposable terminal in a private
-subdirectory; finishing the editor closes it and deletes only that session.
-Save keeps changes; Cancel restores the original config. During preview the
-remote config file is temporarily modified, so avoid editing it elsewhere at
-the same time. If the manager is forcibly killed, the last preview may remain.
+For remote use, forward the server's Unix socket with SSH and connect the client
+to the local forwarded socket. The manager handles this automatically.
 
-## Versions and updates
+## Build and test
 
-`gmux --version` and `gmux-server --version` print the source revision
-(`-dirty` means a local build with uncommitted changes). Releases include a
-checksum-verified `VERSION` file. On startup, `gmuxctl` checks the latest release:
-matching binaries are reused; differing or old unversioned binaries are replaced.
-Client updates live in gmuxctl's private download cache rather than overwriting
-package-managed PATH entries. Remote server updates replace the installed binary
-atomically and copy matching themes. Existing sessions keep their old executable;
-only newly created sessions use the updated server. This is not an automatic
-migration of running sessions or a guarantee of cross-version protocol compatibility.
-Explicit `--client`/`--server-binary` overrides opt out of the corresponding update.
-If the release check is unavailable, installed binaries remain usable.
+Install CMake, a C/C++ toolchain, GTK4 development packages, Git, curl, and tar.
 
-## FAQ
+```sh
+git clone --recurse-submodules --branch gmux-codex https://github.com/mjkpolo/ghostling.git
+cd ghostling
+./build.sh
+./tests/run.sh
+```
 
-### Why Not Zig?
+`build.sh` downloads the pinned Zig version when needed. Use `--server-only` to
+skip GTK, or `--server-musl` for the portable static server. Binaries normally
+appear in `build/`. Use `gmux-manager --client /absolute/path/to/gmux` to test a
+specific terminal binary.
 
-libghostty-vt has a fully capable and proven Zig API. Ghostty GUI itself
-uses this and is a good -- although complex -- example of how to use it.
-However, this demo is meant to showcase the minimal C API since C is so
-much more broadly used and accessible to a wide variety of developers and
-language ecosystems.
+With the manager dependencies installed:
 
-### What about Rust or any other language?
+```sh
+QT_QPA_PLATFORM=offscreen python -m unittest manager.test_ui manager.test_config
+```
 
-libghostty-vt has a C API and can have zero dependencies, so it can be used
-with minimally thin bindings in basically any language. I'm not sure yet if
-the Ghostty project will maintain official bindings for languages other than C
-and Zig, but I hope the community will create and maintain bindings for many
-languages!
+## Credits and license
 
-### Does libghostty require GTK?
-
-**No no no!** libghostty has no opinion about the renderer or GUI framework
-used; it's even standalone WASM-compatible for browsers and other environments.
-
-libghostty provides a [high-performance render state API](https://libghostty.tip.ghostty.org/group__render.html)
-which only keeps track of the _state_ required to build a renderer. This is the
-C interface to Ghostty's render state. Our server copies those values into
-MessagePack messages; the client maintains rows and renders them with
-Cairo/Pango. Ghostty's own GUI uses its native Zig rendering stack.
-
-### Why CMake and GTK?
-
-I needed to pick _something_. Really, any build system and any library
-could be used. CMake is widely used and supported. GTK gives the Linux client
-native Wayland input, layout-aware key events, clipboard
-access, and an event loop close to the one used by Ghostty itself.
-
-### What did the source review change?
-
-See [CHANGE_AUDIT.md](CHANGE_AUDIT.md) for the change-by-change evidence,
-historical failing lines, local reproductions, and removals. The comparisons
-below describe architecture, not claims that these implementations were copied.
-
-- **Fonts:** Ghostty and WezTerm both bundle fonts and can open them directly
-  from memory. Our Pango integration instead extracted them to temporary files
-  and registered them with Fontconfig. We removed that extra lifecycle and use
-  installed fonts, leaving discovery, fallback, weight, and style to Pango.
-  This is a simplification for our Linux client, not a claim that bundled fonts
-  are bad. Sources:
-  [Ghostty embedded fonts](https://github.com/ghostty-org/ghostty/blob/76895d97b74ff6b24c2b1543bcd69ccc18048a4d/src/font/embedded.zig#L8-L19),
-  [Ghostty memory faces](https://github.com/ghostty-org/ghostty/blob/76895d97b74ff6b24c2b1543bcd69ccc18048a4d/src/font/face/freetype.zig#L79-L89),
-  [WezTerm built-ins](https://github.com/wezterm/wezterm/blob/b09b56c29c1e367e598b60ca266e2cc9038751e0/wezterm-font/src/parser.rs#L816-L884),
-  [WezTerm memory stream](https://github.com/wezterm/wezterm/blob/b09b56c29c1e367e598b60ca266e2cc9038751e0/wezterm-font/src/ftwrap.rs#L1287-L1302).
-- **Queued writes:** Ghostty retains owned PTY-write buffers until completion.
-  gmux now retains its unwritten suffix too, using the existing single-threaded
-  poll/GLib loops. No worker thread, locks, or queue dependency is needed.
-  [Ghostty queueWrite](https://github.com/ghostty-org/ghostty/blob/76895d97b74ff6b24c2b1543bcd69ccc18048a4d/src/termio/Exec.zig#L403-L470).
-- **Render boundary:** WezTerm sends semantic dirty lines and metadata, not
-  rendered text pixels. Our row cache remains a sensible smaller analogue;
-  adopting WezTerm's full pane/session interfaces would add machinery we do
-  not need. We are not wire-compatible: WezTerm has stable row IDs, sequence
-  numbers, and on-demand line retrieval; gmux sends changed viewport/overscan
-  rows and currently resends visible image pixels with snapshots.
-  [WezTerm change computation](https://github.com/wezterm/wezterm/blob/b09b56c29c1e367e598b60ca266e2cc9038751e0/wezterm-mux-server-impl/src/sessionhandler.rs#L51-L157).
-
-The review also removed duplicated config/kill implementations and obsolete
-Raylib container/profiling files. It did not replace the renderer with a GPU
-pipeline or complete IME support. Complex-script cell positioning, per-redraw
-image conversion, and the fixed 63-byte grapheme payload remain limitations;
-oversized graphemes display a replacement glyph instead of overrunning memory.
+Originally based on [Ghostling](https://github.com/ghostty-org/ghostling), using
+[Ghostty](https://ghostty.org)'s terminal library. See [LICENSE](LICENSE) and
+dependency licenses; releases include Ghostty's license.

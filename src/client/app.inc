@@ -82,7 +82,8 @@ static gboolean gtk_socket_ready(gint fd, GIOCondition condition,
                 break;
             }
             gtk_scroll_send_rows(client);
-            apply_snapshot_title(client->window, &client->snapshot);
+            if (!client->title_monitor)
+                apply_snapshot_title(client->window, &client->snapshot);
             apply_snapshot_clipboard(client, &client->snapshot);
             gtk_widget_queue_draw(client->area);
         }
@@ -115,6 +116,18 @@ static void gtk_activate(GtkApplication *application, gpointer userdata)
     GtkClient *client = userdata;
     client->window = GTK_WINDOW(gtk_application_window_new(application));
     gtk_window_set_title(client->window, "gmux");
+    const char *title_path = g_getenv("GMUX_TITLE_FILE");
+    if (title_path && *title_path) {
+        GFile *file = g_file_new_for_path(title_path);
+        client->title_monitor = g_file_monitor_file(file, G_FILE_MONITOR_NONE, NULL, NULL);
+        if (client->title_monitor) {
+            g_signal_connect(client->title_monitor, "changed",
+                             G_CALLBACK(manager_title_changed), client);
+            manager_title_changed(client->title_monitor, file, NULL,
+                                  G_FILE_MONITOR_EVENT_CHANGED, client);
+        }
+        g_object_unref(file);
+    }
     gtk_window_set_default_size(client->window, 800, 600);
 
     client->area = gtk_drawing_area_new();
@@ -184,6 +197,7 @@ static int run_client(int socket_fd)
     int result = g_application_run(G_APPLICATION(client.application), 0, NULL);
 
     if (client.socket_source) g_source_remove(client.socket_source);
+    g_clear_object(&client.title_monitor);
     if (client.write_source) g_source_remove(client.write_source);
     if (client.momentum_tick)
         gtk_widget_remove_tick_callback(client.area, client.momentum_tick);

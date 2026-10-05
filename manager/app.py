@@ -10,7 +10,7 @@ from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QBoxLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
-    QMenu, QSystemTrayIcon, QVBoxLayout, QWidget,
+    QComboBox, QMenu, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
 from .backend import Host
@@ -93,7 +93,7 @@ class Manager(QMainWindow):
         reload_button.setToolTip("Read ~/.ssh/config and included files again")
         reload_button.clicked.connect(self.reload_hosts)
         left.addWidget(reload_button)
-        hint = QLabel("Hosts come from ~/.ssh/config.\nEdit that file to add a host.")
+        hint = QLabel("localhost runs directly on this machine.\nRemote hosts come from ~/.ssh/config.")
         hint.setWordWrap(True)
         hint.setObjectName("hint")
         left.addWidget(hint)
@@ -120,6 +120,21 @@ class Manager(QMainWindow):
         self.status.setTextFormat(Qt.TextFormat.PlainText)
         self.status.setWordWrap(True)
         right.addWidget(self.status)
+        folders = QHBoxLayout()
+        self.folder_buttons = []
+        self.folder_list = QComboBox()
+        self.folder_list.addItem("Unfiled", "")
+        self.folder_list.currentIndexChanged.connect(self.show_sessions)
+        folders.addWidget(self.folder_list, 1)
+        for label, callback in (("New folder", self.new_folder),
+                                ("Rename folder", self.rename_folder),
+                                ("Delete folder", self.delete_folder),
+                                ("Open folder", self.open_folder)):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            self.folder_buttons.append(button)
+            folders.addWidget(button)
+        right.addLayout(folders)
         self.session_list = QListWidget()
         self.session_list.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.session_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -139,8 +154,14 @@ class Manager(QMainWindow):
         self.install_button.clicked.connect(self.install_server)
         self.config_button = QPushButton("Config…")
         self.config_button.clicked.connect(self.edit_config)
+        self.rename_button = QPushButton("Rename…")
+        self.rename_button.clicked.connect(self.rename_session)
+        self.move_button = QPushButton("Move…")
+        self.move_button.clicked.connect(self.move_session)
         actions.addWidget(self.new_button)
         actions.addWidget(self.config_button)
+        actions.addWidget(self.rename_button)
+        actions.addWidget(self.move_button)
         actions.addWidget(self.install_button)
         actions.addStretch()
         actions.addWidget(self.delete_button)
@@ -243,14 +264,33 @@ class Manager(QMainWindow):
     def show_host(self, *_):
         name = self.current_host()
         self.title.setText(name or "Your sessions")
+        previous = self.folder_list.currentData()
+        self.folder_list.blockSignals(True)
+        self.folder_list.clear()
+        self.folder_list.addItem("Unfiled", "")
+        host = self.hosts.get(name)
+        if host:
+            for identity, label in host.catalog["folders"].items():
+                self.folder_list.addItem(label, identity)
+        self.folder_list.setCurrentIndex(max(0, self.folder_list.findData(previous)))
+        self.folder_list.blockSignals(False)
+        self.show_sessions()
+        self.status.setText(self.messages.get(name, "Connect to discover sessions on this host."))
+        self.update_actions()
+
+    def show_sessions(self, *_):
+        name = self.current_host()
+        host = self.hosts.get(name)
         self.session_list.clear()
         for state, session in self.entries.get(name, []):
+            if host and host.folder(session) != self.folder_list.currentData():
+                continue
             label = {"live": "Available", "attached": "Attached", "stale": "Stale socket"}.get(state, state)
-            item = QListWidgetItem(f"{session}\n{label}")
+            display = host.label(session) if host else session
+            item = QListWidgetItem(f"{display}\n{label}")
             item.setToolTip(session)
             item.setData(Qt.ItemDataRole.UserRole, (state, session))
             self.session_list.addItem(item)
-        self.status.setText(self.messages.get(name, "Connect to discover sessions on this host."))
         self.update_actions()
 
     def update_actions(self, *_):
@@ -262,10 +302,14 @@ class Manager(QMainWindow):
         self.connect_button.setText("Refresh" if name in self.entries else "Connect")
         self.new_button.setEnabled(ready)
         self.config_button.setEnabled(ready)
+        for button in self.folder_buttons:
+            button.setEnabled(ready)
         selected = self.session_list.currentItem()
         state = selected.data(Qt.ItemDataRole.UserRole)[0] if selected else None
         self.open_button.setEnabled(ready and state == "live")
         self.delete_button.setEnabled(ready and selected is not None)
+        self.rename_button.setEnabled(ready and selected is not None)
+        self.move_button.setEnabled(ready and selected is not None)
         self.install_button.setVisible(bool(idle and host and host.connection and not host.server))
 
     def submit(self, name, action, *args):
@@ -307,6 +351,23 @@ class Manager(QMainWindow):
                                    else "Connected. gmux-server is missing; choose Install server.")
         if name == self.current_host():
             self.show_host()
+        host = self.hosts[name]
+        upgrade = getattr(host, "pending_upgrade", None)
+        if not error and isinstance(upgrade, tuple):
+            host.pending_upgrade = None
+            version, sessions = upgrade
+            message = f"A different server release ({version}) is available for {name}.\n\n"
+            if sessions:
+                message += (f"{len(sessions)} session(s) are running. Stopping them ends their shells "
+                            "and applications, and unsaved work may be lost.\n\n"
+                            "Do you want to stop these sessions and upgrade?")
+            else:
+                message += "Do you want to upgrade?"
+            answer = QMessageBox.warning(self, "Upgrade gmux-server", message,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer == QMessageBox.StandardButton.Yes:
+                self.submit(name, "upgrade_server", version, sessions)
         if name in self.refresh_pending:
             self.refresh_pending.discard(name)
             self.submit(name, "refresh")
@@ -342,7 +403,52 @@ class Manager(QMainWindow):
         name = self.current_host()
         session, accepted = QInputDialog.getText(self, "New session", "Session name")
         if accepted and session:
-            self.submit(name, "create", session)
+            self.submit(name, "create", session, self.folder_list.currentData() or "")
+
+    def new_folder(self):
+        name, accepted = QInputDialog.getText(self, "New folder", "Folder name")
+        if accepted and name:
+            self.submit(self.current_host(), "new_folder", name)
+
+    def rename_folder(self):
+        identity = self.folder_list.currentData()
+        if identity:
+            name, accepted = QInputDialog.getText(self, "Rename folder", "Folder name",
+                                                text=self.folder_list.currentText())
+            if accepted and name:
+                self.submit(self.current_host(), "rename_folder", identity, name)
+
+    def open_folder(self):
+        self.submit(self.current_host(), "open_folder", self.folder_list.currentData() or "")
+
+    def delete_folder(self):
+        identity = self.folder_list.currentData()
+        if not identity:
+            return
+        answer = QMessageBox.question(self, "Delete folder",
+            "Delete the selected folder? Its sessions will move to Unfiled and keep running.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer == QMessageBox.StandardButton.Yes:
+            self.submit(self.current_host(), "delete_folder", identity)
+
+    def rename_session(self):
+        item = self.session_list.currentItem()
+        if item:
+            identity = item.data(Qt.ItemDataRole.UserRole)[1]
+            name, accepted = QInputDialog.getText(self, "Rename terminal", "Name",
+                text=self.hosts[self.current_host()].label(identity))
+            if accepted and name:
+                self.submit(self.current_host(), "rename", identity, name)
+
+    def move_session(self):
+        item = self.session_list.currentItem()
+        if item:
+            labels = [self.folder_list.itemText(i) for i in range(self.folder_list.count())]
+            label, accepted = QInputDialog.getItem(self, "Move terminal", "Folder", labels, editable=False)
+            if accepted:
+                self.submit(self.current_host(), "move", item.data(Qt.ItemDataRole.UserRole)[1],
+                            self.folder_list.itemData(labels.index(label)))
 
     def open_session(self):
         item = self.session_list.currentItem()

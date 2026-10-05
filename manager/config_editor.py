@@ -48,7 +48,7 @@ for path in "$1/themes"/*; do
     [ "${path##*/}" = LICENSE ] || printf '%s\\n' "${path##*/}"
 done
 ''', directory).stdout.splitlines()
-        client = str(api.local_program("gmux", host.client))
+        client = host.client_program()
         fonts = subprocess.run([client, "--list-fonts"], check=True,
                                capture_output=True, text=True).stdout.splitlines()
         if not any(state == "attached" for state, _ in host.refresh()):

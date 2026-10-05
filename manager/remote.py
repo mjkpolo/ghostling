@@ -28,6 +28,8 @@ SSH_OPTIONS = []
 
 def ssh_command(host, *arguments):
     """Ignore configured forwards for short-lived management commands."""
+    if host == "localhost":
+        return ["sh", "-c", " ".join(arguments)]
     return ["ssh", "-S", SSH_CONTROL, "-o", "ClearAllForwardings=yes",
             *SSH_OPTIONS, "--", host, *arguments]
 
@@ -40,6 +42,9 @@ def control_command(*arguments):
 @contextmanager
 def ssh_connection(host, batch_mode=False):
     global SSH_CONTROL, SSH_OPTIONS
+    if host == "localhost":
+        yield
+        return
     with tempfile.TemporaryDirectory(prefix="ssh-", dir=local_dir()) as temp:
         SSH_CONTROL = str(Path(temp) / "control")
         SSH_OPTIONS = (["-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
@@ -139,9 +144,6 @@ def local_program(name, explicit=None):
         if not path.is_file() or not os.access(path, os.X_OK):
             raise RuntimeError(f"{name} not found: {path}")
         return path
-    adjacent = HERE / name
-    if adjacent.is_file() and os.access(adjacent, os.X_OK):
-        return adjacent
     installed = shutil.which(name)
     if installed:
         return Path(installed).resolve()
@@ -404,8 +406,6 @@ def remote_state(host):
 socket_directory=$directory
 if command -v gmux-server >/dev/null 2>&1; then
     candidate=$(command -v gmux-server)
-elif [ -x "$HOME/.local/bin/gmux-server" ]; then
-    candidate=$HOME/.local/bin/gmux-server
 else
     candidate=
 fi
@@ -433,31 +433,38 @@ printf 'server\t%s\nsockets\t%s\nterminfo\t%s\nhas_terminfo\t%s\n' \
     return (values.get("server") or None, values.get("sockets"),
             values.get("terminfo"), values.get("has_terminfo") == "yes")
 
-def start_attachment(host, directory, name, client):
+def start_attachment(host, directory, name, client, title=None):
     if not SESSION_RE.fullmatch(name):
         raise RuntimeError("invalid session name")
     temporary = tempfile.TemporaryDirectory(prefix="attach-", dir=local_dir())
     local = Path(temporary.name) / "terminal.sock"
     remote = f"{directory}/{name}.sock"
     attachment = {"name": name, "directory": temporary,
-                  "forward": f"{local}:{remote}"}
+                  "forward": f"{local}:{remote}", "local": host == "localhost"}
     try:
         # OpenSSH acknowledges the bind before starting the client. Each
         # attachment has its own path; never guess where another socket leads.
-        subprocess.run(control_command("-O", "forward", "-L",
-                                       attachment["forward"]),
-                       check=True, capture_output=True, text=True)
+        if not attachment["local"]:
+            subprocess.run(control_command("-O", "forward", "-L",
+                                           attachment["forward"]),
+                           check=True, capture_output=True, text=True)
+        environment = os.environ.copy()
+        if title is not None:
+            title_path = Path(temporary.name) / "title"
+            title_path.write_text(title)
+            environment["GMUX_TITLE_FILE"] = str(title_path)
         attachment["client"] = subprocess.Popen(
-            [client, "--connect", str(local)])
+            [client, "--connect", remote if attachment["local"] else str(local)], env=environment)
         return attachment
     except Exception:
         stop_attachment(attachment)
         raise
 
 def stop_attachment(attachment):
-    subprocess.run(control_command("-O", "cancel", "-L",
-                                   attachment["forward"]),
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not attachment.get("local"):
+        subprocess.run(control_command("-O", "cancel", "-L",
+                                       attachment["forward"]),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     attachment["directory"].cleanup()
 
 def close_attachment(attachment):

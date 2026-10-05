@@ -47,7 +47,7 @@ class ManagerTest(unittest.TestCase):
             config = Path(temporary) / "config"
             config.write_text("Host alpha beta\n")
             window = Manager(config=config)
-            self.assertEqual(window.host_list.count(), 2)
+            self.assertEqual(window.host_list.count(), 3)
             window.filter.setText("beta")
             self.assertTrue(window.host_list.item(0).isHidden())
             window.host_list.setCurrentRow(1)
@@ -63,6 +63,11 @@ class ManagerTest(unittest.TestCase):
             def __init__(self, name, client):
                 self.name, self.server, self.connection = name, "server", True
                 self.attachments = []
+                self.catalog = {"folders": {}, "sessions": {}}
+            def folder(self, identity):
+                return ""
+            def label(self, identity):
+                return identity
             def connect(self):
                 time.sleep(0.03)
                 return [("live", self.name + "-work")]
@@ -109,6 +114,9 @@ class ManagerTest(unittest.TestCase):
             window.host_list.setCurrentRow(0)
             process = subprocess.Popen([sys.executable, "-c", "input()"], stdin=subprocess.PIPE)
             host = mock.Mock(server="server", attachments=[{"client": process}])
+            host.catalog = {"folders": {}, "sessions": {}}
+            host.folder.return_value = ""
+            host.label.side_effect = lambda identity: identity
             window.hosts["alpha"] = host
             try:
                 with mock.patch.object(window, "submit") as submit, \

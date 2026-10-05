@@ -6,7 +6,7 @@ import shlex
 
 def hosts_from_config(path=None):
     path = Path(path) if path else Path.home() / ".ssh/config"
-    aliases, visited = {}, set()
+    aliases, visited = {"localhost": "localhost"}, set()
 
     def read(source):
         source = source.resolve()

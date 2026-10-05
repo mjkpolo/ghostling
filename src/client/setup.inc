@@ -2,6 +2,7 @@
 typedef struct {
     GtkApplication *application;
     GtkWindow *window;
+    GFileMonitor *title_monitor;
     GtkWidget *area;
     WireConnection connection;
     InputWire input;
@@ -31,6 +32,21 @@ typedef struct {
     uint32_t next_scroll_serial, inflight_scroll_serial;
     int inflight_scroll_rows;
 } GtkClient;
+
+static void manager_title_changed(GFileMonitor *monitor, GFile *file,
+                                  GFile *other, GFileMonitorEvent event,
+                                  gpointer userdata)
+{
+    (void)monitor; (void)other; (void)event;
+    GtkClient *client = userdata;
+    char *title = NULL;
+    if (g_file_load_contents(file, NULL, &title, NULL, NULL, NULL)) {
+        char *valid = g_utf8_make_valid(title, -1);
+        gtk_window_set_title(client->window, valid);
+        g_free(valid);
+        g_free(title);
+    }
+}
 
 // GtkAlertDialog requires GTK 4.10; Rocky's older GTK needs MessageDialog.
 G_GNUC_BEGIN_IGNORE_DEPRECATIONS
