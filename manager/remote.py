@@ -1,9 +1,6 @@
-#!/usr/bin/env python3
-"""Small SSH session manager for gmux."""
+"""SSH provisioning and socket forwarding for the Qt manager."""
 
-import argparse
 from contextlib import contextmanager
-import curses
 from functools import cache
 import hashlib
 import os
@@ -20,18 +17,19 @@ import tempfile
 from urllib.request import urlopen
 
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parents[1]
 RELEASE_REPOSITORY = os.environ.get(
     "GMUX_RELEASE_REPOSITORY", "mjkpolo/ghostling")
 RELEASE_BASE = os.environ.get(
     "GMUX_RELEASE_BASE",
     f"https://github.com/{RELEASE_REPOSITORY}/releases/latest/download")
 SSH_CONTROL = None
+SSH_OPTIONS = []
 
 def ssh_command(host, *arguments):
     """Ignore configured forwards for short-lived management commands."""
     return ["ssh", "-S", SSH_CONTROL, "-o", "ClearAllForwardings=yes",
-            "--", host, *arguments]
+            *SSH_OPTIONS, "--", host, *arguments]
 
 def control_command(*arguments):
     # The master already authenticated using ssh_config. Control requests use
@@ -40,16 +38,36 @@ def control_command(*arguments):
             *arguments, "gmux"]
 
 @contextmanager
-def ssh_connection(host):
-    global SSH_CONTROL
+def ssh_connection(host, batch_mode=False):
+    global SSH_CONTROL, SSH_OPTIONS
     with tempfile.TemporaryDirectory(prefix="ssh-", dir=local_dir()) as temp:
         SSH_CONTROL = str(Path(temp) / "control")
+        SSH_OPTIONS = (["-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+                        "-o", "StrictHostKeyChecking=yes", "-o", "ServerAliveInterval=15",
+                        "-o", "ServerAliveCountMax=2"] if batch_mode else [])
         try:
-            subprocess.run([
+            environment = os.environ.copy()
+            options = SSH_OPTIONS
+            if batch_mode:
+                # Only initial authentication may prompt. Subsequent commands
+                # reuse the master and fail rather than prompting invisibly.
+                helper = Path(temp) / "askpass"
+                helper.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable)
+                                  + " " + shlex.quote(str(Path(__file__).with_name("askpass.py")))
+                                  + ' "$@"\n')
+                helper.chmod(0o700)
+                environment.update(SSH_ASKPASS=str(helper), SSH_ASKPASS_REQUIRE="force")
+                options = ["-o", "BatchMode=no", "-o", "StrictHostKeyChecking=ask", *SSH_OPTIONS]
+            result = subprocess.run([
                 "ssh", "-M", "-N", "-f", "-S", SSH_CONTROL,
+                *options,
                 "-o", "ClearAllForwardings=yes", "-o", "ControlPersist=no",
                 "-o", "StreamLocalBindMask=0177", "--", host,
-            ], check=True)
+            ], capture_output=batch_mode, text=True, env=environment,
+                stdin=subprocess.DEVNULL)
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() if batch_mode
+                                   else f"SSH connection to {host} failed")
             yield
         finally:
             if Path(SSH_CONTROL).exists():
@@ -57,6 +75,7 @@ def ssh_connection(host):
                                stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL)
             SSH_CONTROL = None
+            SSH_OPTIONS = []
 
 def cache_dir():
     root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
@@ -84,7 +103,7 @@ def release_checksums():
     return checksums
 
 def release_asset(name, executable=False):
-    if executable and (platform.system() != "Linux" or platform.machine() not in (
+    if name == "gmux" and executable and (platform.system() != "Linux" or platform.machine() not in (
             "x86_64", "AMD64")):
         raise RuntimeError(
             "published gmux binaries currently support Linux x86_64 only")
@@ -449,303 +468,9 @@ def close_attachment(attachment):
 def reap_attachments(attachments):
     active = []
     for attachment in attachments:
-        if attachment["client"].poll() is None:
+        # The manager's blocking wait thread sets returncode and notifies Qt.
+        if attachment["client"].returncode is None:
             active.append(attachment)
         else:
             stop_attachment(attachment)
     return active
-
-def prompt(stdscr, label):
-    stdscr.timeout(-1)
-    curses.echo()
-    try:
-        height, width = stdscr.getmaxyx()
-        stdscr.move(height - 1, 0)
-        stdscr.clrtoeol()
-        stdscr.addnstr(height - 1, 0, label, max(0, width - 2))
-        return stdscr.getstr(64).decode(errors="replace").strip()
-    finally:
-        curses.noecho()
-        stdscr.timeout(250)
-
-def draw_line(stdscr, row, text):
-    height, width = stdscr.getmaxyx()
-    if 0 <= row < height and width > 1:
-        try:
-            stdscr.addnstr(row, 0, text, width - 1)
-        except curses.error:
-            pass  # Resizes and wide Unicode glyphs can change the space left.
-
-CONFIG_DEFAULTS = {"font": "Monaspace Argon Frozen, monospace",
-                   "font-size": "24", "theme": ""}
-
-def config_values(text):
-    values = dict(CONFIG_DEFAULTS)
-    for line in text.splitlines():
-        key, equals, value = line.partition("=")
-        if equals and key.strip() in values:
-            values[key.strip()] = value.strip()
-    return values
-
-def config_text(original, values):
-    # Preserve comments and unknown options rather than silently deleting them.
-    lines, seen = [], set()
-    for line in original.splitlines():
-        key = line.partition("=")[0].strip()
-        if "=" in line and key in values:
-            line = f"{key} = {values[key]}"
-            seen.add(key)
-        lines.append(line)
-    lines.extend(f"{key} = {value}" for key, value in values.items() if key not in seen)
-    return "\n".join(lines) + "\n"
-
-def write_remote_config(host, path, text):
-    run_ssh(host, r'''
-set -eu
-umask 077
-temporary=$(mktemp "$1.XXXXXX")
-trap 'rm -f -- "$temporary"' EXIT
-printf '%s' "$2" > "$temporary"
-mv -f -- "$temporary" "$1"
-''', path, text)
-
-def fuzzy_options(options, query):
-    query = query.casefold()
-    def matches(option):
-        letters = iter(option.casefold())
-        return all(any(letter == wanted for letter in letters) for wanted in query)
-    found = [option for option in options if matches(option)]
-    return sorted(found, key=lambda name: (not name.casefold().startswith(query),
-                                           len(name), name.casefold())) if query else options
-
-def config_picker(stdscr, key, options, current, preview):
-    query, selected, shown = "", options.index(current) if current in options else 0, current
-    while True:
-        height, width = stdscr.getmaxyx()
-        if height < 8 or width < 25:
-            return current
-        window = curses.newwin(height - 2, width - 4, 1, 2)
-        window.keypad(True)
-        window.box()
-        window.addnstr(1, 2, f"{key}: {query}", width - 9)
-        choices = fuzzy_options(options, query)
-        selected = min(selected, max(0, len(choices) - 1))
-        count = height - 7
-        start = max(0, selected - count + 1)
-        for row, index in enumerate(range(start, min(len(choices), start + count)), 2):
-            label = choices[index] or "(default colors)"
-            window.addnstr(row, 2, label, width - 9,
-                           curses.A_REVERSE if index == selected else 0)
-        window.addnstr(height - 4, 2, "Enter select  Esc cancel  Ctrl-N/P move", width - 9)
-        window.refresh()
-        if choices and choices[selected] != shown:
-            shown = choices[selected]
-            preview(shown)
-        pressed = window.getch()
-        if pressed == 27:
-            preview(current)
-            return current
-        if pressed in (10, 13, curses.KEY_ENTER) and choices:
-            return choices[selected]
-        if pressed in (curses.KEY_DOWN, 14):
-            selected = min(selected + 1, max(0, len(choices) - 1))
-        elif pressed in (curses.KEY_UP, 16):
-            selected = max(selected - 1, 0)
-        elif pressed in (curses.KEY_BACKSPACE, 127, 8):
-            query, selected = query[:-1], 0
-        elif 32 <= pressed < 127:
-            query, selected = query + chr(pressed), 0
-
-def edit_config(stdscr, host, server, directory, client):
-    config_dir = remote_config_dir(host)
-    path = f"{config_dir}/config"
-    original = run_ssh(host, 'if [ -f "$1" ]; then cat -- "$1"; fi', path).stdout
-    values = config_values(original)
-    themes = run_ssh(host, r'''
-for path in "$1/themes"/*; do
-    [ -f "$path" ] || continue
-    [ "${path##*/}" = LICENSE ] || printf '%s\n' "${path##*/}"
-done
-''', config_dir).stdout.splitlines()
-    fonts = subprocess.run([client, "--list-fonts"], check=True,
-                           capture_output=True, text=True).stdout.splitlines()
-    choices = {"font": sorted(set(fonts + [values["font"], "monospace"])),
-               "font-size": [str(size) for size in range(6, 97)],
-               "theme": [""] + sorted(set(themes + [values["theme"]]) - {""})}
-    preview_dir = run_ssh(host, 'umask 077; mktemp -d "$1/preview.XXXXXX"', directory).stdout.strip()
-    attachment = None
-    preview_path = f"{preview_dir}/gmux/config"
-    try:
-        # A private config and shell isolate preview output from real sessions.
-        run_ssh(host, r'''
-set -eu
-umask 077
-mkdir "$1/gmux"
-ln -s "$2/themes" "$1/gmux/themes"
-printf '#!/bin/sh\n%s\nexec /bin/sh\n' "$3" > "$1/shell"
-chmod 700 "$1/shell"
-''', preview_dir, config_dir, os.environ.get("GMUX_PREVIEW_COMMAND", "echo gmux"))
-        write_remote_config(host, preview_path, config_text(original, values))
-        run_ssh(host, 'XDG_CONFIG_HOME="$2" SHELL="$2/shell" "$1" "$2/preview.sock"',
-                server, preview_dir)
-        attachment = start_attachment(host, preview_dir, "preview", client)
-        selected, message = 0, ""
-        keys = list(CONFIG_DEFAULTS)
-        while True:
-            stdscr.erase()
-            height, _ = stdscr.getmaxyx()
-            draw_line(stdscr, 0, f"Config on {host} (all sessions): {path}")
-            draw_line(stdscr, 1, "Enter edit  j/k or Ctrl-N/P move  s save  q cancel")
-            for index, key in enumerate(keys):
-                draw_line(stdscr, index + 3,
-                          f"{'>' if index == selected else ' '} {key:12} [ {values[key]} ]")
-            draw_line(stdscr, height - 2, message or "Changes affect only the preview until saved.")
-            stdscr.refresh()
-            pressed = stdscr.getch()
-            if pressed in (ord("q"), 27):
-                return "Config changes discarded."
-            if pressed in (ord("j"), curses.KEY_DOWN, 14):
-                selected = min(selected + 1, len(keys) - 1)
-            elif pressed in (ord("k"), curses.KEY_UP, 16):
-                selected = max(selected - 1, 0)
-            elif pressed in (10, 13, curses.KEY_ENTER):
-                key = keys[selected]
-                def preview(value):
-                    values[key] = value
-                    write_remote_config(host, preview_path, config_text(original, values))
-                values[key] = config_picker(stdscr, key, choices[key], values[key], preview)
-            elif pressed == ord("s"):
-                write_remote_config(host, path, config_text(original, values))
-                return "Saved remote config; running servers will reload it."
-    finally:
-        if attachment:
-            close_attachment(attachment)
-        # Only files created by this editor, never the shared config/themes.
-        # --kill queues shutdown; it does not wait for the daemon to unlink.
-        run_ssh(host, r'''
-"$1" --kill "$2/preview.sock" >/dev/null 2>&1 || true
-rm -f -- "$2/preview.sock" "$2/gmux/config" "$2/gmux/themes" "$2/shell"
-rmdir "$2/gmux" "$2"
-''', server, preview_dir, check=False)
-
-def tui(stdscr, host, server, directory, client):
-    curses.curs_set(0)
-    stdscr.timeout(250)
-    selected, offset, message, attachments = 0, 0, "", []
-    refresh = True
-    entries = []
-    try:
-        while True:
-            attachments = reap_attachments(attachments)
-            try:
-                if refresh:
-                    entries = sessions(host, server, directory)
-            except Exception as error:
-                entries, message = [], str(error)
-            refresh = False
-            selected = min(selected, max(0, len(entries) - 1))
-            height, _ = stdscr.getmaxyx()
-            visible = max(0, height - 5)
-            offset = max(0, min(offset, selected))
-            if visible and selected >= offset + visible:
-                offset = selected - visible + 1
-            stdscr.erase()
-            draw_line(stdscr, 0, f"gmux sessions on {host}  ({directory})")
-            draw_line(stdscr, 1, "j/k move  Enter attach  n new  d delete  c/e config  r refresh")
-            for index in range(offset, min(len(entries), offset + visible)):
-                status, name = entries[index]
-                marker = ">" if index == selected else " "
-                draw_line(stdscr, index - offset + 3, f"{marker} {name} [{status}]")
-            draw_line(stdscr, height - 2, message)
-            draw_line(stdscr, height - 1,
-                      f"{len(attachments)} window(s); q closes manager and windows")
-            stdscr.refresh()
-            key = stdscr.getch()
-            if key == -1:
-                continue
-            message = ""
-            if key in (ord("q"), 27):
-                return
-            if key == ord("r"):
-                refresh = True
-            if key in (ord("j"), curses.KEY_DOWN) and entries:
-                selected = min(selected + 1, len(entries) - 1)
-            elif key in (ord("k"), curses.KEY_UP) and entries:
-                selected = max(selected - 1, 0)
-            elif key in (10, 13, curses.KEY_ENTER) and entries:
-                status, name = entries[selected]
-                if status == "stale":
-                    message = "That socket is stale; delete it with d first."
-                elif status == "attached" or any(
-                        item["name"] == name for item in attachments):
-                    message = f"{name} already has a window open."
-                else:
-                    try:
-                        attachments.append(start_attachment(
-                            host, directory, name, client))
-                        message = f"Opened {name}; gmuxctl remains available."
-                    except Exception as error:
-                        message = str(error)
-            elif key in (ord("c"), ord("e")):
-                try:
-                    message = edit_config(stdscr, host, server, directory, client)
-                except Exception as error:
-                    message = str(error)
-            elif key == ord("n"):
-                name = prompt(stdscr, "new session name: ")
-                try:
-                    create_session(host, server, directory, name)
-                    refresh = True
-                except Exception as error:
-                    message = str(error)
-            elif key == ord("d") and entries:
-                _, name = entries[selected]
-                answer = prompt(stdscr, f"delete {name}? [y/N] ")
-                if answer.lower() == "y":
-                    try:
-                        delete_session(host, server, directory, name)
-                        refresh = True
-                    except Exception as error:
-                        message = str(error)
-    finally:
-        for attachment in attachments:
-            close_attachment(attachment)
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("host", help="SSH host or alias")
-    parser.add_argument("--client", help="local gmux binary override")
-    parser.add_argument("--server-binary",
-                        help="local gmux-server binary override")
-    args = parser.parse_args()
-    client = local_program("gmux", args.client)
-    version = latest_version() if not (args.client and args.server_binary) else None
-    if version and not args.client:
-        client = update_client(client, version)
-    with ssh_connection(args.host):
-        server, directory, terminfo, has_terminfo = remote_state(args.host)
-        if not server:
-            answer = input("gmux-server is missing remotely. Copy it? [y/N] ")
-            if answer.lower() != "y":
-                return 1
-            destination = input("remote directory [~/.local/bin]: ").strip()
-            server_binary = (release_asset("gmux-server", executable=True)
-                             if version and not args.server_binary
-                             else local_program("gmux-server", args.server_binary))
-            server = copy_server(args.host, server_binary,
-                                 destination or "~/.local/bin",
-                                 release_themes=bool(version and not args.server_binary))
-        if version and not args.server_binary:
-            server = update_server(args.host, server, version)
-        if not has_terminfo:
-            provision_terminfo(args.host, terminfo, checked=True)
-        provision_themes(args.host, args.server_binary)
-        curses.wrapper(tui, args.host, server, directory, str(client))
-    return 0
-
-if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
-        print(f"gmuxctl: {error}", file=sys.stderr)
-        raise SystemExit(1)

@@ -13,7 +13,38 @@ on:
   workflow_dispatch:
 
 jobs:
+  manager:
+    name: Qt manager (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build and install manager wheel
+        run: |
+          python -m pip install build
+          python -m build --wheel
+          python -m pip install dist/*.whl
+          gmux-manager --help
+      - name: Test manager
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m unittest discover -s tests -p test_manager.py -v
+          python -m unittest manager.test_ui -v
+          python -c 'from gmux_manager.backend import Host; assert Host("test").api.SSH_CONTROL is None'
+      - uses: actions/upload-artifact@v4
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          name: gmux-manager-wheel
+          path: dist/*.whl
+
   build:
+    needs: manager
     runs-on: ubuntu-latest
     container: rockylinux/rockylinux:9.4
     steps:
@@ -35,6 +66,12 @@ jobs:
         run: |
           message=$(tail -80 rocky-build.log | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
           echo "::error title=Rocky build log::$message"
+      - uses: actions/download-artifact@v4
+        with:
+          name: gmux-manager-wheel
+          path: artifacts/
+      - name: Checksum manager package
+        run: cd artifacts && sha256sum *.whl >> SHA256SUMS
       - uses: actions/upload-artifact@v4
         if: success()
         with:
@@ -53,7 +90,7 @@ jobs:
           files: |
             artifacts/gmux
             artifacts/gmux-server
-            artifacts/gmuxctl
+            artifacts/*.whl
             artifacts/gmux-themes.tar.gz
             artifacts/xterm-ghostty.terminfo
             artifacts/GHOSTTY-LICENSE

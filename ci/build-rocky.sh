@@ -18,7 +18,6 @@ artifact_dir="$PWD/artifacts"
 rm -rf "$artifact_dir"
 mkdir -p "$artifact_dir"
 cp build/gmux "$server" "$artifact_dir/"
-cp gmuxctl "$artifact_dir/"
 "$server" --version | cut -d ' ' -f 2 > "$artifact_dir/VERSION"
 test "$(cat "$artifact_dir/VERSION")" != unknown
 test "$(build/gmux --version | cut -d ' ' -f 2)" = "$(cat "$artifact_dir/VERSION")"
@@ -42,6 +41,6 @@ tar -C "$artifact_dir" -czf "$artifact_dir/gmux-themes.tar.gz" themes
 
 (
   cd "$artifact_dir"
-  sha256sum gmux gmux-server gmuxctl gmux-themes.tar.gz \
+  sha256sum gmux gmux-server gmux-themes.tar.gz \
     xterm-ghostty.terminfo GHOSTTY-LICENSE VERSION > SHA256SUMS
 )

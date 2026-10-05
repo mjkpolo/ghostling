@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=gmux Manager
+Comment=Manage terminal sessions across SSH hosts
+Exec=gmux-manager
+Icon=gmux-manager
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupNotify=true
+StartupWMClass=gmux-manager

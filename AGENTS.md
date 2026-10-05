@@ -44,7 +44,7 @@
 - The current prototype has separate `gmux` GUI and persistent `gmux-server`
   binaries communicating over a Unix socket. SSH Unix-socket forwarding is the
   proposed remote transport; pane-layout details are undecided.
-- `gmuxctl` is the dependency-free Python/curses session manager. It discovers
+- The Python/Qt session manager discovers
   remote sockets, distinguishes live and stale sessions with `gmux-server
   --check`, creates and deletes sessions, provisions the bundled `xterm-ghostty`
   terminfo, and owns per-attachment SSH Unix-socket forwarding. Socket
@@ -53,6 +53,14 @@
   attachment. Do not reuse arbitrary existing forwards or probe them by
   attaching a GUI. `--check` returns 0 for idle, 2 for attached/busy, and 1 for
   stale/invalid. Check and kill must remain responsive while a GUI is attached.
+- The Qt/PySide6 manager lives in `manager/`, installs as `gmux-manager` via
+  pip, and can also start from `./run-manager.sh`. The curses gmuxctl was
+  removed; its transport/provisioning lives in `manager/remote.py`.
+  It is a separate window for all hosts, not terminal UI. Window close hides
+  to the tray when available; Quit closes attachments but not remote sessions.
+  Hosts are read-only aliases from `~/.ssh/config` and its includes. Never add
+  host-editing controls or write SSH config; users manage it in their editor.
+  Host identicons are generated locally from a stable hostname hash.
 - Earlier Eustis tests observed ControlMaster permission failures and servers
   disappearing after SSH logout, but did not establish the cause. Do not treat
   those observations as proof of host policy. ControlMaster errors can arise
@@ -66,9 +74,9 @@
   extracts font files. Default: `Monaspace Argon Frozen, monospace`, size 24.
 - Configuration belongs only to the server. Font settings/errors travel in
   snapshots; runtime font-size adjustments are retained by the server session.
-  `gmuxctl` installs themes under the remote config directory and provides a
-  c/e editor with an isolated temporary preview. Saving affects the host's
-  shared config; cancelling must not modify it. Never delete existing client
+  The manager installs themes under the remote config directory. Its future
+  Qt editor should preview changes in running terminals, not use the removed
+  curses editor/preview-command mechanism. Never delete existing client
   config files or legacy theme folders as part of this migration.
 - Rendering and input are event-driven. The server sends changed rows; the GTK
   client retains the current visible rows and overscan. Preserve Kitty images

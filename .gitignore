@@ -1,3 +1,6 @@
 build/
 .direnv/
 .cache/
+__pycache__/
+*.egg-info/
+dist/

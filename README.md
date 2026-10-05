@@ -141,8 +141,51 @@ vendored libraries are the normal build's libraries, not sanitizer rebuilds.
 
 ## Linux releases
 
+### Qt host manager
+
+`./run-manager.sh` opens the Python/PySide6 manager. It reads named aliases from
+`~/.ssh/config` and `Include` files; wildcard/negated patterns are not selectable
+hosts. OpenSSH still resolves all actual connection options, including `Match`.
+The manager never edits SSH config. Use **Reload hosts** after editing it.
+
+Install its dependencies once (all tools remain outside the source tree):
+
+```sh
+python3 -m venv ../tools/gmux-manager-venv
+PIP_CACHE_DIR=../.cache/pip ../tools/gmux-manager-venv/bin/pip install .
+./run-manager.sh
+# Optional: test a specific terminal executable without release downloads
+./run-manager.sh --client "$PWD/build/gmux"
+```
+
+Alternatively set `GMUX_MANAGER_PYTHON` to a Python executable with PySide6.
+Select a host, then **Connect**. Create sessions with **New session**, and
+double-click an available session to open a terminal without leaving the manager.
+**Refresh** updates that host's session status. Each connected host retains its
+own SSH master. **Delete** asks for confirmation, including for stale sockets.
+If the remote server is missing, **Install server** asks for its remote destination
+directory (default `~/.local/bin`), then downloads the checksum-verified release
+server and themes. Published servers currently target Linux x86-64.
+
+Authentication uses configured SSH keys/agent or graphical password/MFA prompts,
+with explicit confirmation for unknown host fingerprints. This first version uses installed/cached
+binaries without automatic version updates, has no settings editor yet,
+and asks before closing its terminal windows when quitting. Closing the window hides it in the tray when a tray is available. The tray menu
+has **Show manager** and **Quit**. With no tray, closing quits normally. Launching
+again shows the existing instance. Terminal exits notify the UI via blocking OS
+process waits, not a polling timer; unrelated external session changes still need
+**Refresh**. Remote sessions are not killed on manager exit. The shared manager targets Linux/macOS, but only Linux
+has been tested so far; a native macOS terminal client is separate future work.
+
+Tests: `./tests/run.sh` includes the manager's non-GUI tests. With PySide6 installed,
+run `QT_QPA_PLATFORM=offscreen ../tools/gmux-manager-venv/bin/python -m unittest manager.test_ui`.
+Local live verification also covered localhost SSH, two GTK windows under isolated
+headless Sway, reconnecting to surviving sessions, and removal of only test sessions.
+
+### Published binaries
+
 - Every push to `gmux-codex` publishes a GitHub release containing `gmux`,
-  `gmux-server`, `gmuxctl`, themes, terminfo, and `SHA256SUMS`. The binaries
+  `gmux-server`, a pip-installable manager wheel, themes, terminfo, and `SHA256SUMS`. The binaries
   use Rocky Linux 9.4 for the GTK client's glibc 2.34 baseline; the server
   is fully static musl with baseline x86-64 CPU instructions. CI checks that
   the server has no dynamic loader or shared-library dependencies and runs
@@ -157,31 +200,33 @@ mkdir -p "$XDG_RUNTIME_DIR/gmux"
 ./gmux --connect "$XDG_RUNTIME_DIR/gmux/gmux.sock"
 ```
 
-Or let the session manager provision `xterm-ghostty`, create secure socket
-directories, detect stale sessions, and manage SSH Unix-socket forwarding:
+Install the shared Qt manager from the repository (or install the wheel attached
+to a GitHub release):
 
 ```sh
-./gmuxctl my-ssh-host
+python3 -m pip install "git+https://github.com/mjkpolo/ghostling.git@gmux-codex"
+gmux-manager --install-desktop  # Linux application menu / Fuzzel
+gmux-manager
 ```
 
-`gmuxctl` is a standalone Python script. It first looks beside itself and on
-`PATH`, then in its download cache; if `gmux` is missing, it downloads and
-SHA-256 verifies the latest Rocky release into `$XDG_CACHE_HOME/gmux` (or
-`~/.cache/gmux`). Version checks reuse current binaries and update outdated ones.
-If the remote
-host lacks `gmux-server`, it asks before downloading the verified server and
-copying it to `~/.local/bin` or another directory you choose. An explicit
-local build can be selected with `--client` or `--server-binary`.
+Use a virtual environment or pipx if your system Python is externally managed.
+This does not publish the package to PyPI; bare `pip install gmux-manager` is
+not yet a supported installation route. Linux's desktop launcher records the
+environment's absolute Python path, so that environment must remain installed.
+It adds no autostart entry and does not change Sway keybindings. macOS uses
+`gmux-manager` directly for now; .app packaging is future work.
 
-The session list remains open when you attach: each Enter launches another
-GTK window in the background, so different sessions on the same host can be
-open at once. One private OpenSSH ControlMaster connection serves the manager
-and all of its windows. It uses your SSH host, authentication, and jump-host
-configuration, while excluding configured port forwards. Each attachment gets
-its own private directory and Unix-socket forward; existing sockets are never
-reused or replaced. Closing a window removes its forward. Quitting the manager
-closes its windows and SSH connection; the remote sessions remain subject to
-the remote host's normal session-lifetime policy.
+The manager looks for `gmux` on PATH and in its download cache, downloading and
+checking the release checksum if absent. Use `--client /path/to/gmux` to select
+a bespoke client (required on macOS until one is published). One private SSH
+ControlMaster serves each connected host. Every terminal window gets its own
+private Unix-socket forward; the forward is removed when the window exits.
+Host-key trust and authentication remain OpenSSH's responsibility.
+The standard `SSH_ASKPASS` mechanism opens a Qt password/passphrase or MFA
+dialog during connection. Credentials are passed directly back to SSH, never
+saved. Unknown hosts require explicit fingerprint confirmation (default: No);
+changed host keys are rejected by SSH. Later commands reuse the authenticated
+master and do not prompt if it has disconnected.
 
 The manager uses `$GMUX_SOCKET_DIR`, then `$XDG_RUNTIME_DIR/gmux`, and finally
 `/tmp/gmux-$UID`. It requires the directory to be owned by the current user
@@ -219,7 +264,7 @@ which resolves them against locally installed fonts.
 Named themes are searched in the config directory's `themes` folder, `$GMUX_THEME_DIR`, the
 `themes` directory beside `gmux-server`, and the system gmux data directories.
 An absolute theme file path is also accepted.
-`gmuxctl` installs themes in the server's config directory (`~/.config/gmux/themes`
+The manager installs themes in the server's config directory (`~/.config/gmux/themes`
 normally), preserving existing files so customized themes are not overwritten.
 Existing theme folders are not deleted. To use a theme in an old location,
 specify its absolute path or set `GMUX_THEME_DIR` to that directory.
@@ -237,27 +282,11 @@ use monospace as a fallback. Messages include the source file, line, option and
 configured value. Invalid themes do not prevent starting a session, so an attached
 client can display the diagnostic. Update both binaries for the new config records.
 
-### Live config editor
+### Config editing
 
-In `gmuxctl`, press **c** or **e** to edit the host's shared config. Enter opens
-a fuzzy-search picker for installed client fonts, sizes 6–96, or server themes.
-Use arrows or Ctrl-N/Ctrl-P to navigate; typing resets to the first match.
-Highlighted choices immediately update a separate preview window in place.
-Enter accepts a choice; Escape restores the value before opening the picker.
-
-The preview runs in an isolated temporary server session/config. Unsaved changes
-are sent only to that temporary config, never the real host config. **s** saves
-the real config atomically and triggers reload in existing servers; **q** cancels.
-Both close and remove the preview. The editor preserves comments and unknown keys
-without adding concurrent-editor locking. Saving affects all sessions using
-that host config, not only the highlighted session.
-
-`GMUX_PREVIEW_COMMAND` specifies a command to run **on the remote host**. It
-defaults to `echo gmux`, followed by a shell so the preview stays open. For example:
-
-```sh
-GMUX_PREVIEW_COMMAND='printf "\\033[31mred\\033[0m normal\\n"' ./gmuxctl my-host
-```
+The old curses editor and `GMUX_PREVIEW_COMMAND` were removed with gmuxctl.
+For now edit the server config directly; running servers reload it automatically.
+A Qt editor with live preview across attached terminals is planned.
 
 ## Versions and updates
 

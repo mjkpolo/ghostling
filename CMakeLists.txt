@@ -107,7 +107,6 @@ endif()
 
 if (GMUX_BUILD_CLIENT)
   install(TARGETS gmux RUNTIME DESTINATION bin)
-  install(PROGRAMS gmuxctl DESTINATION bin)
 endif()
 if (GMUX_BUILD_SERVER)
   install(TARGETS gmux-server RUNTIME DESTINATION bin)
