@@ -54,7 +54,7 @@
   attaching a GUI. `--check` returns 0 for idle, 2 for attached/busy, and 1 for
   stale/invalid. Check and kill must remain responsive while a GUI is attached.
 - The Qt/PySide6 manager lives in `manager/`, installs as `gmux-manager` via
-  pip, and can also start from `./run-manager.sh`. The curses gmuxctl was
+  pip. Use the installed entry point, not a wrapper script. The curses gmuxctl was
   removed; its transport/provisioning lives in `manager/remote.py`.
   It is a separate window for all hosts, not terminal UI. Window close hides
   to the tray when available; Quit closes attachments but not remote sessions.
@@ -74,8 +74,8 @@
   extracts font files. Default: `Monaspace Argon Frozen, monospace`, size 24.
 - Configuration belongs only to the server. Font settings/errors travel in
   snapshots; runtime font-size adjustments are retained by the server session.
-  The manager installs themes under the remote config directory. Its future
-  Qt editor should preview changes in running terminals, not use the removed
+  The manager installs themes under the remote config directory. Its
+  Qt editor previews changes in running terminals, not using the removed
   curses editor/preview-command mechanism. Never delete existing client
   config files or legacy theme folders as part of this migration.
 - Rendering and input are event-driven. The server sends changed rows; the GTK

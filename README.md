@@ -143,7 +143,7 @@ vendored libraries are the normal build's libraries, not sanitizer rebuilds.
 
 ### Qt host manager
 
-`./run-manager.sh` opens the Python/PySide6 manager. It reads named aliases from
+`gmux-manager` opens the Python/PySide6 manager. It reads named aliases from
 `~/.ssh/config` and `Include` files; wildcard/negated patterns are not selectable
 hosts. OpenSSH still resolves all actual connection options, including `Match`.
 The manager never edits SSH config. Use **Reload hosts** after editing it.
@@ -153,12 +153,11 @@ Install its dependencies once (all tools remain outside the source tree):
 ```sh
 python3 -m venv ../tools/gmux-manager-venv
 PIP_CACHE_DIR=../.cache/pip ../tools/gmux-manager-venv/bin/pip install .
-./run-manager.sh
+../tools/gmux-manager-venv/bin/gmux-manager
 # Optional: test a specific terminal executable without release downloads
-./run-manager.sh --client "$PWD/build/gmux"
+../tools/gmux-manager-venv/bin/gmux-manager --client "$PWD/build/gmux"
 ```
 
-Alternatively set `GMUX_MANAGER_PYTHON` to a Python executable with PySide6.
 Select a host, then **Connect**. Create sessions with **New session**, and
 double-click an available session to open a terminal without leaving the manager.
 **Refresh** updates that host's session status. Each connected host retains its
@@ -169,7 +168,7 @@ server and themes. Published servers currently target Linux x86-64.
 
 Authentication uses configured SSH keys/agent or graphical password/MFA prompts,
 with explicit confirmation for unknown host fingerprints. This first version uses installed/cached
-binaries without automatic version updates, has no settings editor yet,
+binaries without automatic version updates,
 and asks before closing its terminal windows when quitting. Closing the window hides it in the tray when a tray is available. The tray menu
 has **Show manager** and **Quit**. With no tray, closing quits normally. Launching
 again shows the existing instance. Terminal exits notify the UI via blocking OS
@@ -210,6 +209,19 @@ gmux-manager
 ```
 
 Use a virtual environment or pipx if your system Python is externally managed.
+To install without building, download `gmux_manager-0.1.0-py3-none-any.whl`
+from the GitHub release and run these commands inside a virtual environment:
+
+```sh
+python -m pip install ./gmux_manager-0.1.0-py3-none-any.whl
+gmux-manager --install-desktop
+```
+
+The wheel includes the manager, desktop launcher, and icon. Pip installs its
+PySide6 dependency separately; Python and system Qt runtime libraries (including
+`libEGL.so.1`, provided by `libegl1` on Ubuntu) are still required. CI builds and
+tests the manager on Linux only.
+
 This does not publish the package to PyPI; bare `pip install gmux-manager` is
 not yet a supported installation route. Linux's desktop launcher records the
 environment's absolute Python path, so that environment must remain installed.
@@ -286,7 +298,13 @@ client can display the diagnostic. Update both binaries for the new config recor
 
 The old curses editor and `GMUX_PREVIEW_COMMAND` were removed with gmuxctl.
 For now edit the server config directly; running servers reload it automatically.
-A Qt editor with live preview across attached terminals is planned.
+Choose **Config…** on a connected host to edit its font, font size, and theme.
+Changes preview through the shared remote config in running sessions. If no
+terminal is attached, the editor opens a disposable terminal in a private
+subdirectory; finishing the editor closes it and deletes only that session.
+Save keeps changes; Cancel restores the original config. During preview the
+remote config file is temporarily modified, so avoid editing it elsewhere at
+the same time. If the manager is forcibly killed, the last preview may remain.
 
 ## Versions and updates
 

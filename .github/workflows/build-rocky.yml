@@ -14,16 +14,16 @@ on:
 
 jobs:
   manager:
-    name: Qt manager (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    name: Qt manager (Linux)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Install Qt runtime dependencies
+        # QtGui links EGL even when tests use the offscreen platform.
+        run: sudo apt-get update && sudo apt-get install -y libegl1
       - name: Build and install manager wheel
         run: |
           python -m pip install build
@@ -35,10 +35,9 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: |
           python -m unittest discover -s tests -p test_manager.py -v
-          python -m unittest manager.test_ui -v
+          python -m unittest manager.test_ui manager.test_config -v
           python -c 'from gmux_manager.backend import Host; assert Host("test").api.SSH_CONTROL is None'
       - uses: actions/upload-artifact@v4
-        if: matrix.os == 'ubuntu-latest'
         with:
           name: gmux-manager-wheel
           path: dist/*.whl

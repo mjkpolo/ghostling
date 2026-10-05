@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 from .backend import Host
 from .ssh_hosts import hosts_from_config
 from .desktop import ASSETS, Instance, install_launcher
+from .config_editor import ConfigEditor
 
 
 def host_icon(name):
@@ -136,7 +137,10 @@ class Manager(QMainWindow):
         self.delete_button.clicked.connect(self.delete_session)
         self.install_button = QPushButton("Install server…")
         self.install_button.clicked.connect(self.install_server)
+        self.config_button = QPushButton("Config…")
+        self.config_button.clicked.connect(self.edit_config)
         actions.addWidget(self.new_button)
+        actions.addWidget(self.config_button)
         actions.addWidget(self.install_button)
         actions.addStretch()
         actions.addWidget(self.delete_button)
@@ -257,6 +261,7 @@ class Manager(QMainWindow):
         self.connect_button.setEnabled(idle)
         self.connect_button.setText("Refresh" if name in self.entries else "Connect")
         self.new_button.setEnabled(ready)
+        self.config_button.setEnabled(ready)
         selected = self.session_list.currentItem()
         state = selected.data(Qt.ItemDataRole.UserRole)[0] if selected else None
         self.open_button.setEnabled(ready and state == "live")
@@ -323,6 +328,15 @@ class Manager(QMainWindow):
 
     def connect_host(self):
         self.submit(self.current_host(), "connect")
+
+    def edit_config(self):
+        name = self.current_host()
+        self.busy.add(name)
+        try:
+            ConfigEditor(self, self.hosts[name]).exec()
+        finally:
+            self.busy.discard(name)
+            self.submit(name, "refresh")
 
     def new_session(self):
         name = self.current_host()
