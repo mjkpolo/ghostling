@@ -100,6 +100,11 @@ reboots and remain subject to the host's logout/cleanup policies.
 
 ### Appearance
 
+Selecting terminal text copies it to the clipboard when you release the left
+mouse button. This does not apply when the running application handles mouse
+input. A plain click does not replace the clipboard. Ctrl+Shift+V pastes;
+Ctrl+Shift+C is not reserved by gmux and is passed to the application.
+
 Choose **Config…** to edit the host's font, font size, and theme. Open terminals
 preview changes in place. If none are attached, a disposable preview terminal
 opens and is removed when you finish. **Save** keeps changes; **Cancel** restores

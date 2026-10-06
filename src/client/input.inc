@@ -25,12 +25,6 @@ static gboolean gtk_key_pressed(GtkEventControllerKey *controller,
     }
     if ((state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
             == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)
-        && (keyval == GDK_KEY_c || keyval == GDK_KEY_C)) {
-        gtk_copy_selection(client);
-        return TRUE;
-    }
-    if ((state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
-            == (GDK_CONTROL_MASK | GDK_SHIFT_MASK)
         && (keyval == GDK_KEY_v || keyval == GDK_KEY_V)) {
         gtk_clear_selection(client);
         gtk_paste(client);
@@ -48,8 +42,7 @@ static gboolean gtk_key_pressed(GtkEventControllerKey *controller,
     default:
         gtk_clear_selection(client);
         // Match Ghostty's immediate visual response for a real terminal key.
-        // Local bindings returned above (notably Ctrl+Shift+C) deliberately do
-        // not clear the scroll position.
+        // Local bindings returned above do not clear the scroll position.
         client->scroll_y = 0;
         client->inflight_scroll_rows = 0;
         client->inflight_scroll_serial = 0;
@@ -126,9 +119,12 @@ static void gtk_mouse_click(GtkGestureClick *gesture, int presses,
                     : presses == 2 ? SELECTION_WORD : SELECTION_CELL,
             };
             gtk_selection_expand(client, row, col);
-        } else {
+        } else if (client->selection.dragging) {
             gtk_selection_expand(client, row, col);
             client->selection.dragging = false;
+            // Only terminal-owned selections reach here. A plain click has
+            // no active range, so gtk_copy_selection leaves the clipboard alone.
+            gtk_copy_selection(client);
         }
         gtk_widget_queue_draw(client->area);
         return;

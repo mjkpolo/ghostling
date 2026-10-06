@@ -63,10 +63,10 @@ static void test_queued_paste(void)
 
 static void test_shortcut_release(void)
 {
-    // Ctrl+Shift+C's press was consumed locally. Even if the modifiers have
-    // already been released, its C release must not reach the server.
+    // Ctrl+Shift+V's press was consumed locally. Even if the modifiers have
+    // already been released, its V release must not reach the server.
     GtkClient client = { .connection.fd = -1 };
-    gtk_key_released(NULL, GDK_KEY_c, 54, 0, &client);
+    gtk_key_released(NULL, GDK_KEY_v, 55, 0, &client);
     assert(client.input.len == 0 && client.connection.output.end == 0);
 }
 
